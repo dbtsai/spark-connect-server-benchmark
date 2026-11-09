@@ -1,0 +1,27 @@
+[package]
+name = "spark-connect-jni"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "Apache-2.0"
+description = "JNI host for the Spark Connect Rust server and direct Spark JVM handlers"
+build = "build.rs"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+spark-connect-server = { path = ".." }
+futures = "0.3"
+arrow = { version = "58", default-features = false, features = ["ipc", "ffi"] }
+prost = "0.14"
+spark-connect-proto = { package = "apache-spark-connect-proto", git = "https://github.com/apache/spark-connect-rust.git", rev = "9ed82b874357cdff887977864026d98f8b00f434" }
+libc = "0.2"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time"] }
+tonic = "0.14"
+
+[build-dependencies]
+cc = "1"
+
+[profile.dev]
+debug = 0

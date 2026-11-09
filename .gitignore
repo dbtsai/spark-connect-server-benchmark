@@ -1,0 +1,11 @@
+target/
+.build/
+.venv*/
+results/
+__pycache__/
+*.py[cod]
+.DS_Store
+*.log
+derby.log
+metastore_db/
+spark-warehouse/

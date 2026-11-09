@@ -1,0 +1,79 @@
+{
+  "schema_version": 1,
+  "experiment_limit": 2,
+  "matrix": {
+    "profile": "standard",
+    "concurrency": [
+      1,
+      8,
+      32
+    ],
+    "requests": 64,
+    "warmups": 32,
+    "repetitions": 1,
+    "session_models": [
+      "shared"
+    ],
+    "channel_models": [
+      "shared"
+    ],
+    "max_prepared_mib": 60
+  },
+  "targets": [
+    {
+      "case": "config/get",
+      "concurrency": [
+        8,
+        32
+      ]
+    },
+    {
+      "case": "analyze/range",
+      "concurrency": [
+        8,
+        32
+      ]
+    },
+    {
+      "case": "analyze/chain_8",
+      "concurrency": [
+        8,
+        32
+      ]
+    },
+    {
+      "case": "analyze/wide_32",
+      "concurrency": [
+        8,
+        32
+      ]
+    },
+    {
+      "case": "analyze/balanced_join_8",
+      "concurrency": [
+        8,
+        32
+      ]
+    }
+  ],
+  "min_target_throughput_ratio": 1.15,
+  "min_improved_targets": 2,
+  "max_median_latency_ratio": 1.2,
+  "min_throughput_ratio": 0.8,
+  "max_p95_latency_ratio": 1.5,
+  "max_client_cpu_per_request_ratio": 1.25,
+  "require_all_pairs_target_improve": false,
+  "interpretation": "Exploratory local descriptive gate, not statistical significance. Every measured cell is a guard. Any failed correctness sample invalidates comparison. Same-binary control and independent confirmation required; noisy or failed guards are not silently accepted.",
+  "schedule": {
+    "noise_control_pairs": 2,
+    "screen_pairs": 3,
+    "confirmation_pairs": 3,
+    "order": "alternate AB/BA; confirmation starts opposite order"
+  },
+  "holdouts": [
+    "full smoke all four session/channel sharing combinations",
+    "bounded standard corpus at concurrency1/8/32",
+    "executed Spark/JNI acceptance and cancellation/Arrow ownership tests"
+  ],
+  "min_completed_round_throughput_ratio": 0.8
+}

@@ -1,0 +1,252 @@
+# Execution-free Spark Connect concurrency benchmarks
+
+This suite uses the official Apache Spark Connect Rust logical-plan builders and
+generated protobuf/gRPC client. It measures bounded concurrent RPCs with varied
+plans, Arrow types, payload sizes, session sharing, and channel sharing.
+
+Two profiles answer different questions:
+
+| Profile | Rust target | JVM target | Work performed |
+| --- | --- | --- | --- |
+| Synthetic protocol | `rust-fixture` | `jvm-fixture` | Decode requests, maintain fixture session/operation state, replay identical prebuilt Arrow responses, and exercise all RPC routes. Neither fixture creates a Spark session or evaluates a plan. |
+| Real planning | `rust-jvm-planning` | `jvm-planning` | Analyze real plans and access session configuration through the native Spark engine or upstream Spark Connect. A Spark listener requires zero job starts. |
+
+The synthetic comparison measures these fixtures and their tonic/JVM shaded-gRPC
+stacks. Their analysis responses select a canned schema; they do not resolve the
+request plan. It does not measure the complete production Rust/JVM frontends.
+The planning comparison uses the production paths, including Catalyst through JNI
+for the Rust target. It sends only safe `AnalyzePlan`, `Config`, and session-release
+calls. Local Arrow decoding and planning still consume CPU and memory. Spark task
+execution and worker-to-driver result production are outside both profiles.
+
+## Coverage and workload dimensions
+
+Untimed correctness/capability probes touch all 12 Spark Connect RPC routes in the
+synthetic profile: ExecutePlan, AnalyzePlan, Config, AddArtifacts, ArtifactStatus,
+Interrupt, ReattachExecute, ReleaseExecute, ReleaseSession, FetchErrorDetails,
+CloneSession, and GetStatus. They exercise 14 AnalyzePlan variants and all seven
+Config variants, stream schema/batch/completion framing, reattachment cursors,
+release/interrupt selectors, session cloning and isolation, structured errors,
+artifact upload forms, and per-chunk CRC rejection. Unsupported variants and
+deliberate error paths have explicit outcomes. Planning probes list excluded
+routes and persistence-changing analysis variants separately.
+
+The official Rust client is pinned to revision
+`9ed82b874357cdff887977864026d98f8b00f434`, whose protocol is Spark 4.3. The local
+Spark assembly is 4.2, so its JVM fixture returns `UNIMPLEMENTED` for GetStatus.
+That capability gap is retained and excluded from successful throughput. Coverage
+of every route does not imply conformance for every protobuf field, relation,
+expression, command, extension, UDF, catalog operation, or data type.
+
+The corpus includes ranges, SQL, projection/filter chains, wide projections,
+balanced joins, unions, aggregates, windows/sorts, literals, and local Arrow
+relations. Six Arrow families cover primitives, Unicode strings/binary,
+decimals/dates/timestamps, structs/lists, maps, and null-heavy values. Per-case
+metadata records plan nodes/depth, encoded size, data dimensions, and type/variant
+inventories.
+
+Configuration probes follow Spark's `GetAll(prefix)` behavior: returned names
+have the requested prefix removed, while an omitted or empty prefix preserves
+full names. Both fixtures and the JNI Spark engine apply that behavior, and
+regression checks cover filtered and unfiltered responses.
+
+Corpus preparation also completes compatibility details before timing. The pinned
+Rust client omits type annotations needed by Spark for complex literals, so the
+typed-literal projection fills each root `Literal.data_type` from the declared
+expected schema. Case metadata records this normalization and the final encoded
+size. Arrow map payloads explicitly use the child names `entries`, `key`, and
+`value` required by Spark's Arrow Java reader, replacing Arrow Rust's default
+plural key/value names. These are input-format corrections; the cases remain in
+the workload and undergo schema validation. Export a fresh corpus with the
+current binary after generator changes, since literal annotations and map IPC
+schemas change the frozen bytes and hashes.
+
+| Corpus | Plans | Example dimensions |
+| --- | ---: | --- |
+| `smoke` | 23 | Chain depth 4, width 8, four join/union leaves, 0/4 KiB local-data targets, 128-byte string/binary literals. |
+| `standard` | 48 | Chains 1/8/16, widths 1/32/128, joins 2/8, unions 2/8/16, local-data targets through 1 MiB, literals through 1 MiB. |
+| `stress` | 60 | Chains through 20, width 1,024, joins 32, unions 20, local-data/literal targets through 16 MiB. |
+
+Size targets describe the generator input, not exact Arrow IPC message size;
+recorded encoded lengths give the actual sizes. Fixture replay limits each IPC
+payload to 8 MiB and all preloaded payloads to 64 MiB. Larger request cases remain
+in the planning corpus; the manifest explains each response-payload exclusion.
+The smoke export contains 13 replay payloads. Streams use one or eight batches,
+with the larger payloads limited to one batch. Artifact workloads vary upload
+size and batched/chunked framing.
+
+Session and channel sharing vary independently. `shared` sessions put concurrent
+workers in one session; `isolated` gives each worker a separate session. Shared
+channels multiplex HTTP/2 streams; isolated channels establish one transport per
+worker. Session-release workloads use a prepared session per request because a
+session cannot be repeatedly released as independent live work.
+
+## Timing and reporting
+
+Workers use a closed loop with a bounded number of in-flight RPCs. `--requests`
+is the total measured requests in each round and must cover the largest
+concurrency. Each cell has fixed warmups and repetitions; warmup count is at least
+the worker count. There are no application retries.
+
+Corpus generation, plan construction, channel/session setup, and lifecycle
+dependencies are prepared before the round barrier. Primary latency includes
+client protobuf encoding, RPC transfer, response decoding, and full stream drain.
+Throughput uses the primary round's wall time. Response assertions and lifecycle
+cleanup run after all workers finish, outside that window; their time and errors
+are recorded separately. Completed-round throughput additionally includes request
+and lifecycle preparation plus validation/cleanup. It still excludes server
+startup, channel/session establishment, and warmups. Neither rate is labeled
+sustained capacity. First-message latency can refer to a schema header;
+first-Arrow latency separately measures arrival of the first data batch.
+Response byte counts are protobuf encoded
+lengths, excluding HTTP/2/TLS framing.
+
+Prepared requests and retained responses have a default estimated 256 MiB
+per-cell budget. `--max-prepared-mib` changes it; excluded cells retain their
+resource-budget reason. The fixtures also bound retained operations and artifacts
+to 4,096 per session; rounds whose prepared state would exceed those limits are
+explicitly skipped with that reason. This budget is not a bound on total JVM or
+client RSS.
+
+The runner launches one target at a time with fresh server processes, alternating
+forward/reverse target order between forks. It freezes and hashes the benchmark
+binary, Java jar, native library when required, scripts, and exported corpus.
+It retains client/server logs, commands, versions, host load, process snapshots,
+listener ownership, shutdown evidence, fixture execution counters, and the
+planning profile's zero-Spark-jobs audit.
+
+The reporter writes `REPORT.md`, `summary.json`, `cells.csv`, and
+`comparisons.csv`. Accepted forks include median/p95/p99, first-message and
+first-Arrow latency, request rate, response MiB/s, bytes, and client CPU for
+successful cells. Unsupported and skipped cells remain explicit. The reporter
+checks that the requested cell grid is complete, counting measured and explicitly
+skipped cells, and rejects duplicated cells or settings that differ from the run
+manifest. Comparisons match the same profile, case, sharing models, concurrency,
+repetition identities, and counts within a
+fresh-fork pair. Ratios are summarized across forks; individual RPC samples are
+not treated as independent server replications. A smoke run checks correctness
+and wiring. More forks, a quiet host, and client-saturation checks are needed to
+interpret performance, and this closed-loop suite does not measure open-loop
+arrival-rate SLOs.
+
+A failed or incomplete client, failed coverage, invalid counters, or missing
+shutdown/no-execution evidence rejects the entire fork from summarized
+measurements and comparisons. Available raw per-fork `client.json`, `client.log`,
+`server.log`, and `fork.json` remain in the run directory; report validation
+errors identify the raw client JSON for diagnosis. Rejected forks' individual
+samples are read from those raw files rather than copied into successful
+`summary.json` groups. Within accepted forks, excluded unsupported/failing cell
+counts and statuses remain under `non_success_cells`, and explicit budget
+exclusions remain under `skipped_cells`. The reporter still writes its output
+files for an invalid run and exits with a nonzero status. A startup failure may
+precede client JSON creation; its server log and fork record provide the
+diagnostic evidence.
+
+## Memory and measurement limits
+
+In the tested Spark assembly, driver-side local Arrow analysis can retain native
+resources when no task-completion callback closes its reader. Repeated large
+inputs have exhausted memory through both real planning frontends. Start with a
+60 MiB prepared-cell budget and retain every explicit skip. This budget does not
+fix the Spark reader lifecycle or bound total JVM native memory.
+
+Identical-binary comparisons can also show substantial variation. The
+[RSI workflow](RSI.md) checks measurement stability before evaluating candidate
+performance and retains failed controls. No performance improvement is assumed.
+
+## Build and run
+
+Run commands from the repository root. Use Rust 1.88 or newer,
+`protoc`, Python 3.9 or newer, JDK 21, and a matching Spark 4.2 assembly containing
+the shaded Connect gRPC jars. The JNI engine uses Spark internal APIs pinned to
+the assembly documented in the main README; other versions may require changes.
+
+```sh
+export JAVA_HOME=/path/to/jdk-21
+export SPARK_HOME=/path/to/spark-4.2-assembly
+cargo build --locked --release --manifest-path benchmarks/protocol/Cargo.toml --target-dir target
+jvm/build.sh
+cargo build --locked --release --manifest-path jni/Cargo.toml --target-dir target
+```
+
+Use `libspark_connect_jni.so` on Linux in place of the macOS
+`.dylib` below. Supply a native library and jar from the same build.
+
+Start with route/lifecycle validation for all four targets:
+
+```sh
+python3 benchmarks/protocol/run.py --output /absolute/new-protocol-check \
+  --profile smoke --coverage-only --forks 1 \
+  --spark-home "$SPARK_HOME" --java-home "$JAVA_HOME" \
+  --library "$PWD/target/release/libspark_connect_jni.dylib"
+python3 benchmarks/protocol/report.py /absolute/new-protocol-check
+```
+
+A small timed smoke run exercises the full corpus and all sharing combinations:
+
+```sh
+python3 benchmarks/protocol/run.py --output /absolute/new-protocol-smoke \
+  --profile smoke --forks 1 --concurrency 1,4 --requests 8 --warmups 4 --repetitions 1 \
+  --spark-home "$SPARK_HOME" --java-home "$JAVA_HOME" \
+  --library "$PWD/target/release/libspark_connect_jni.dylib"
+python3 benchmarks/protocol/report.py /absolute/new-protocol-smoke
+```
+
+For a larger comparison:
+
+```sh
+python3 benchmarks/protocol/run.py --output /absolute/new-protocol-standard \
+  --profile standard --forks 4 --concurrency 1,8,32 --requests 64 --warmups 16 --repetitions 3 \
+  --spark-home "$SPARK_HOME" --java-home "$JAVA_HOME" \
+  --library "$PWD/target/release/libspark_connect_jni.dylib"
+python3 benchmarks/protocol/report.py /absolute/new-protocol-standard
+```
+
+`--targets rust-fixture,jvm-fixture` runs just the synthetic comparison;
+`--targets rust-jvm-planning,jvm-planning` runs just real planning.
+`--case SUBSTRING` filters timed cases while preserving protocol probes.
+`--payload-dir DIRECTORY` reuses an exported corpus, copied into the new result
+directory. The output directory must be new, and all servers bind to loopback.
+
+The Rust binary also supports `export`, `serve-fixture`, `run`, and `codec` for
+manual experiments. `codec` records local protobuf encode/decode costs without a
+server; it is a separate measurement and is never subtracted from RPC timings.
+
+Reporter regression tests run without a server:
+
+```sh
+python3 -m unittest discover -s benchmarks/protocol/tests -p 'test_*.py'
+```
+
+## Compare native engine builds with RSI
+
+`compare.py` runs the production `rust-jvm-planning` target with two saved jar and
+native-library pairs. Both variants keep that target name. The wrapper copies
+the original runner, reporter, load generator, corpus, policy, and artifacts;
+checks their hashes before and after each child; and alternates fresh JVMs in
+AB/BA order. Save both builds outside the build output directory before running.
+
+```sh
+python3 benchmarks/protocol/compare.py --output /absolute/new-engine-comparison \
+  --baseline-jar /absolute/baseline/bridge.jar \
+  --baseline-library /absolute/baseline/libspark_connect_jni.dylib \
+  --candidate-jar /absolute/candidate/bridge.jar \
+  --candidate-library /absolute/candidate/libspark_connect_jni.dylib \
+  --payload-dir /absolute/frozen-smoke-corpus --policy /absolute/policy.json \
+  --profile smoke --concurrency 1,8,32 --requests 1024 --warmups 512 \
+  --repetitions 3 --pairs 3 --start-order AB \
+  --spark-home "$SPARK_HOME" --java-home "$JAVA_HOME"
+```
+
+First use `--control --pairs 2` with identical artifacts for both variants. A
+failed control prevents a performance claim. Freeze the policy before candidate
+measurement; its optional `matrix` must match the command, including case filters.
+The gate requires declared target improvements and checks every measured cell's
+latency, throughput, completed-round throughput, and client CPU per request.
+Sharing topologies cannot inflate the count of distinct improved targets.
+
+`COMPARE.md` and `compare.json` retain each fresh-fork pair and failed child.
+Ratios use geometric means across paired forks. Passing this exploratory gate
+still requires an independent run starting in the opposite order, broader
+sharing/corpus holdouts, and executed-query, cancellation, and JNI ownership
+validation. Keep builds, profiling, and unrelated heavy work outside timing.
