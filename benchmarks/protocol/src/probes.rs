@@ -17,7 +17,7 @@ use tonic::transport::{Channel, Endpoint};
 use tonic::{Code, Request, Status};
 use uuid::Uuid;
 
-const ROUTES: [&str; 12] = [
+pub const ROUTES: [&str; 12] = [
     "ExecutePlan",
     "AnalyzePlan",
     "Config",

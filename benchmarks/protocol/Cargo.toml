@@ -22,6 +22,8 @@ tonic-prost = "0.14"
 uuid = { version = "1", features = ["v4"] }
 crc32fast = "1"
 libc = "0.2"
+sha2 = "0.10"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 [build-dependencies]
 tonic-build = "0.14"

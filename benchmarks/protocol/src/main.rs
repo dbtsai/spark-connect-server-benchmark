@@ -18,6 +18,16 @@ fn help() {
     println!(
         r#"Spark Connect protocol concurrency benchmark (official Rust client/protobufs)
 
+suite --output DIRECTORY [--targets rust-fixture,jvm-fixture,jvm-planning,rust-jvm-planning]
+    [--profile smoke|standard|stress] [--forks 2] [--concurrency 1,8,32]
+    [--requests 64] [--warmups 16] [--repetitions 3] [--coverage-only]
+    [--spark-home DIRECTORY] [--java-home DIRECTORY] [--binary FILE] [--jar FILE] [--library FILE]
+report --input RUN_DIRECTORY
+compare --output DIRECTORY --baseline-jar FILE --baseline-library FILE
+    --candidate-jar FILE --candidate-library FILE [--policy FILE] [--pairs 3]
+    [--start-order AB|BA] [--control] [--requests 128] [--warmups 64] [--repetitions 2]
+api-audit [--output result.json] [--strict]
+
 export --profile smoke|standard|stress --output DIRECTORY
 serve-fixture --payload-dir DIRECTORY [--listen 127.0.0.1:0] [--threads 4]
 run --endpoint http://127.0.0.1:PORT --mode fixture|planning --payload-dir DIRECTORY
@@ -42,7 +52,10 @@ fn args() -> Result<(String, BTreeMap<String, String>), String> {
         if !key.starts_with("--") {
             return Err(format!("expected option, got {key}"));
         }
-        let value = if matches!(key.as_str(), "--coverage-only" | "--help") {
+        let value = if matches!(
+            key.as_str(),
+            "--coverage-only" | "--help" | "--control" | "--strict"
+        ) {
             "true".into()
         } else {
             a.next().ok_or_else(|| format!("missing value for {key}"))?
@@ -194,6 +207,39 @@ fn run() -> Result<bool, String> {
     if matches!(command.as_str(), "help" | "--help" | "-h") || options.contains_key("--help") {
         help();
         return Ok(true);
+    }
+    if command == "suite" {
+        spark_connect_protocol_bench::runner::run(
+            spark_connect_protocol_bench::runner::RunOptions::from_options(&options)?,
+        )?;
+        return Ok(true);
+    }
+    if command == "report" {
+        check_options(&options, &["--input"])?;
+        let directory = PathBuf::from(required(&options, "--input")?);
+        let valid = spark_connect_protocol_bench::report::report(&directory)?;
+        println!(
+            "{}",
+            json!({"valid":valid,"report":directory.join("REPORT.md")})
+        );
+        return Ok(valid);
+    }
+    if command == "compare" {
+        return spark_connect_protocol_bench::compare::run(
+            spark_connect_protocol_bench::compare::CompareOptions::from_options(&options)?,
+        );
+    }
+    if command == "api-audit" {
+        check_options(&options, &["--output", "--strict"])?;
+        let value = spark_connect_protocol_bench::api_audit::audit()?;
+        if let Some(path) = options.get("--output") {
+            spark_connect_protocol_bench::harness_util::save(&PathBuf::from(path), &value)?;
+        }
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?
+        );
+        return Ok(!options.contains_key("--strict") || value["has_client_gaps"] == false);
     }
     if command == "export" {
         check_options(&options, &["--profile", "--output"])?;

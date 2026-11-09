@@ -40,3 +40,10 @@ Both modes use internal Spark APIs pinned to the assembly in the root README.
 Run on a quiet host, retain raw failures and artifact hashes, and interpret paired
 fresh-process ratios rather than treating individual requests as independent
 server replications. Optional `report.py --plot` needs Matplotlib.
+
+The optional runner's option guards use only Python's standard library and do
+not start Spark:
+
+```sh
+python3 -m unittest discover -s benchmarks/tests -p 'test_*.py'
+```

@@ -322,6 +322,7 @@ pub fn export(cases: &[PlanCase], directory: &Path) -> Result<Value, String> {
         "schema_file": "payload-range.schema.pb", "arrow_file": "payload-range.arrow"}));
     replay_bytes += bytes.len();
     let manifest = json!({"version": 1, "cases": entries, "payloads": payloads,
+        "rust_api_audit": crate::api_audit::audit()?,
         "response_payload_bytes": replay_bytes, "response_payload_limit_bytes": 8 * 1024 * 1024,
         "response_total_limit_bytes": 64 * 1024 * 1024,
         "result_semantics": "prebuilt fixture replay; no plan evaluation"});
@@ -375,7 +376,7 @@ fn string_type() -> SparkType {
     }
 }
 
-fn typed_literals() -> PlanCase {
+pub(crate) fn raw_typed_literals() -> PlanCase {
     let values = vec![
         (
             "boolean",
@@ -486,20 +487,27 @@ fn typed_literals() -> PlanCase {
             .map(|(name, _, ty, nullable)| field(name, ty.clone(), *nullable))
             .collect(),
     );
-    let literal_types = values
-        .iter()
-        .map(|(_, _, data_type, _)| data_type.to_proto())
-        .collect::<Vec<_>>();
     let columns = values
         .into_iter()
         .map(|(name, value, _, _)| Column::new(Expression::literal(value)).alias(name));
-    let mut case = case(
+    case(
         "typed_literals",
         "typed_literals",
         plan::project(plan::range(0, 1, 1), columns),
         schema,
-        json!({"input_rows": 1, "literal_data_type_fields": "explicit_from_declared_schema"}),
-    );
+        json!({"input_rows": 1, "literal_data_type_fields": "official_client_unmodified"}),
+    )
+}
+
+fn typed_literals() -> PlanCase {
+    let mut case = raw_typed_literals();
+    let Some(proto::data_type::Kind::Struct(schema)) = case.expected_schema.kind.as_ref() else {
+        unreachable!("typed literal schema is a struct");
+    };
+    let literal_types = schema
+        .fields
+        .iter()
+        .map(|field| field.data_type.clone().expect("declared type"));
     // The pinned official client omits both Array.element_type and the current
     // Literal.data_type field. Spark requires the root type for complex values.
     // Keep the official plan builders and complete these protocol annotations
@@ -521,6 +529,8 @@ fn typed_literals() -> PlanCase {
         literal.data_type = Some(data_type);
     }
     case.metadata["encoded_relation_bytes"] = json!(case.relation.encoded_len());
+    case.metadata["details"]["literal_data_type_fields"] = json!("explicit_from_declared_schema");
+    case.metadata["rust_api_gap_ids"] = json!(["typed_array_literal_annotations"]);
     case
 }
 

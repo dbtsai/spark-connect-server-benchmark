@@ -34,13 +34,14 @@ Concurrency, session sharing, and HTTP/2 channel sharing vary independently.
 ## Requirements
 
 - Rust 1.88 or newer, Cargo, and `protoc`.
-- Python 3.9 or newer for orchestration/reporting; protocol benchmarks use only
-  the Python standard library and the Rust load generator.
+- Protocol orchestration, reporting, comparison, API auditing, and regression
+  tests run in Rust; the protocol suite does not require Python.
+- `suite` and `compare` process-group orchestration support macOS and Linux.
 - For JVM targets: JDK 21, a C compiler with JNI headers, and a matching Spark 4.2
   assembly with shaded Connect gRPC jars. Listener ownership inspection requires
   `lsof`; the protocol runner also supports Linux `/proc` as a fallback.
-- Executed-query benchmarks and Python acceptance additionally need a compatible
-  official PySpark Connect client, gRPC, and PyArrow.
+- The separate executed-query benchmarks and Python acceptance need Python 3.9
+  or newer, a compatible official PySpark Connect client, gRPC, and PyArrow.
 
 The official Rust client/protocol is pinned to
 [`9ed82b874357cdff887977864026d98f8b00f434`](https://github.com/apache/spark-connect-rust/commit/9ed82b874357cdff887977864026d98f8b00f434)
@@ -56,10 +57,10 @@ Run commands from the repository root. A Rust-only fixture smoke run needs no JV
 
 ```sh
 cargo build --locked --release --manifest-path benchmarks/protocol/Cargo.toml --target-dir target
-python3 benchmarks/protocol/run.py --output results/rust-fixture-smoke \
+target/release/spark-connect-protocol-bench suite --output results/rust-fixture-smoke \
   --targets rust-fixture --profile smoke --forks 1 \
   --concurrency 1,4 --requests 8 --warmups 4 --repetitions 1
-python3 benchmarks/protocol/report.py results/rust-fixture-smoke
+results/rust-fixture-smoke/artifacts/harness report --input results/rust-fixture-smoke
 ```
 
 Build the JVM targets and Rust server adapter:
@@ -74,15 +75,34 @@ cargo build --locked --release --manifest-path jni/Cargo.toml --target-dir targe
 Then exercise all four targets, including the real Spark planning paths:
 
 ```sh
-python3 benchmarks/protocol/run.py --output results/protocol-smoke \
+target/release/spark-connect-protocol-bench suite --output results/protocol-smoke \
   --profile smoke --forks 1 --concurrency 1,4 \
   --requests 8 --warmups 4 --repetitions 1 --max-prepared-mib 60
-python3 benchmarks/protocol/report.py results/protocol-smoke
+results/protocol-smoke/artifacts/harness report --input results/protocol-smoke
 ```
 
 The native filename defaults to `libspark_connect_jni.dylib` on macOS and
 `libspark_connect_jni.so` on Linux. `SPARK_HOME`/`JAVA_HOME` can also be supplied
 with `--spark-home`/`--java-home`. Use a new output directory for every run.
+
+The benchmark crate exposes its corpus, runner, reporter, comparison, and audit
+modules as a Rust library. Plans originate from the pinned official Rust public
+logical-plan/expression APIs; all-route protocol probes use its generated
+protobuf/gRPC bindings. The separate audit records observed gaps before corpus
+compatibility corrections:
+
+```sh
+target/release/spark-connect-protocol-bench api-audit --output results/rust-api-audit.json
+```
+
+See [Rust API gaps](benchmarks/protocol/RUST_API_GAPS.md) for scope and evidence.
+`api-audit --strict` exits nonzero when an observed client gap remains. A suite
+freezes its executable at `artifacts/harness`; using that copy for reporting
+preserves the producer identity recorded in `analysis_reporter_sha256`.
+
+The [executed-query profile](benchmarks/README.md) remains an optional PySpark
+workflow, alongside the JVM Python acceptance checks. Rust replaces the core
+Python protocol runner, reporter, comparator, and their regression tests.
 
 ## Interpretation and limits
 
@@ -111,8 +131,6 @@ repository does not claim a verified Rust/JVM performance improvement.
 ## Validation
 
 ```sh
-python3 -m unittest discover -s benchmarks/protocol/tests
-python3 -m unittest discover -s jvm -p 'test_*.py'
 cargo test --locked --manifest-path benchmarks/protocol/Cargo.toml --target-dir target
 cargo test --locked
 cargo test --locked --manifest-path jni/Cargo.toml --target-dir target
@@ -125,4 +143,5 @@ JAVA_HOME="$JAVA_HOME" jni/test-c-export.sh --sanitize
 JNI tests require `JAVA_HOME`. Real Spark acceptance and benchmark runs require
 the assembly described above; Python acceptance needs its client dependencies.
 See [executed-query instructions](benchmarks/README.md) for JNI checking and
-cancellation/result validation.
+cancellation/result validation. Optional Python acceptance guard tests run with
+`python3 -m unittest discover -s jvm -p 'test_*.py'`.

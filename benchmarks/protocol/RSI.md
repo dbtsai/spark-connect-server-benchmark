@@ -1,8 +1,17 @@
 # Benchmark-driven optimization
 
-Use the same frozen benchmark to decide whether to keep one product change.
+Use the same frozen Rust benchmark to decide whether to keep one product change.
 Passing a local performance gate is exploratory evidence; it also needs independent
 correctness checks, confirmation, and broader coverage.
+
+The `spark-connect-protocol-bench` executable owns `suite`, `report`, `compare`,
+and `api-audit`; its public Rust library exposes the same implementation. Corpus
+plans originate from the official Rust public APIs, with generated protobuf/gRPC
+bindings used for route probes. Run `api-audit` to inspect unmodified API output
+and keep observed gaps separate from declared corpus compatibility corrections.
+See [Rust API gaps](RUST_API_GAPS.md) for evidence and scope. This execution-free
+workflow requires no Python; the optional [executed-query profile](../README.md)
+and Python acceptance checks remain independent holdouts.
 
 1. Save baseline source, dependency locks, build command/toolchain, artifact
    SHA256 values, and host context. Copy its jar and native library outside build
@@ -42,7 +51,7 @@ cp target/release/libspark_connect_jni.dylib results/baseline/
 Use `.so` on Linux. Set `SPARK_HOME` and `JAVA_HOME`, then run:
 
 ```sh
-python3 benchmarks/protocol/compare.py --output results/noise-control \
+target/release/spark-connect-protocol-bench compare --output results/noise-control \
   --baseline-jar results/baseline/bridge.jar \
   --baseline-library results/baseline/libspark_connect_jni.dylib \
   --candidate-jar results/baseline/bridge.jar \
@@ -52,9 +61,27 @@ python3 benchmarks/protocol/compare.py --output results/noise-control \
 ```
 
 Both variant labels must have identical jar and native-library hashes. The
-wrapper retains the `rust-jvm-planning` target name for both; it does not label a
-candidate as the upstream JVM server. It exports and freezes a corpus, or accepts
-`--payload-dir` to reuse an existing export.
+coordinator retains the `rust-jvm-planning` target name for both; it does not label
+a candidate as the upstream JVM server. It exports and freezes a corpus, or
+accepts `--payload-dir` to reuse an existing export.
+
+The coordinator freezes the Rust harness and load generator along with server
+artifacts, policy, and corpus, and verifies source/snapshot hashes before and
+after each child. It invokes the frozen executable for both `suite` and `report`.
+Each child summary must identify those reporter bytes in
+`analysis_reporter_sha256`; a summary from another reporter invalidates the
+comparison. Individual suite output also retains `artifacts/harness` for
+reproducible standalone reporting:
+
+```sh
+results/example-suite/artifacts/harness report --input results/example-suite
+target/release/spark-connect-protocol-bench api-audit --output results/rust-api-audit.json
+cargo test --locked --manifest-path benchmarks/protocol/Cargo.toml --target-dir target --lib
+```
+
+The tests exercise orchestration, reporting, comparisons, and API contracts
+without Spark servers. `api-audit --strict` returns nonzero while a documented
+observed gap remains; it is separate from benchmark validity.
 
 ## Candidate and confirmation
 
@@ -62,7 +89,7 @@ After a passing control, build and validate one candidate and save its matching
 jar/library under `results/candidate/`. Run:
 
 ```sh
-python3 benchmarks/protocol/compare.py --output results/screen \
+target/release/spark-connect-protocol-bench compare --output results/screen \
   --baseline-jar results/baseline/bridge.jar \
   --baseline-library results/baseline/libspark_connect_jni.dylib \
   --candidate-jar results/candidate/bridge.jar \

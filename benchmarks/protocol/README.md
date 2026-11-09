@@ -4,6 +4,14 @@ This suite uses the official Apache Spark Connect Rust logical-plan builders and
 generated protobuf/gRPC client. It measures bounded concurrent RPCs with varied
 plans, Arrow types, payload sizes, session sharing, and channel sharing.
 
+The `spark-connect-protocol-bench` executable performs corpus export, fresh-process
+orchestration, reporting, build comparison, and API auditing in Rust. Its public
+library exposes the same `corpus`, `runner`, `report`, `compare`, and `api_audit`
+modules for reuse. The protocol harness and its regression tests do not require
+Python. The optional [executed-query benchmark](../README.md) and Python Spark
+acceptance remain separate workflows. Rust replaces the core Python protocol
+runner, reporter, comparator, and their regression tests.
+
 Two profiles answer different questions:
 
 | Profile | Rust target | JVM target | Work performed |
@@ -61,6 +69,14 @@ the workload and undergo schema validation. Export a fresh corpus with the
 current binary after generator changes, since literal annotations and map IPC
 schemas change the frozen bytes and hashes.
 
+The unmodified public Rust API output remains the source of truth for client-gap
+claims. `api-audit` inspects that output before the corpus applies compatibility
+corrections, reports the observed typed-array annotation gap, and distinguishes
+generated-binding route coverage from high-level session API parity. Arrow map
+child naming is recorded as interoperability evidence. See
+[Rust API gaps](RUST_API_GAPS.md); this audit is not an exhaustive API inventory.
+Exported corpus manifests retain the observations under `rust_api_audit`.
+
 | Corpus | Plans | Example dimensions |
 | --- | ---: | --- |
 | `smoke` | 23 | Chain depth 4, width 8, four join/union leaves, 0/4 KiB local-data targets, 128-byte string/binary literals. |
@@ -108,12 +124,21 @@ to 4,096 per session; rounds whose prepared state would exceed those limits are
 explicitly skipped with that reason. This budget is not a bound on total JVM or
 client RSS.
 
-The runner launches one target at a time with fresh server processes, alternating
-forward/reverse target order between forks. It freezes and hashes the benchmark
-binary, Java jar, native library when required, scripts, and exported corpus.
+The Rust runner launches one target at a time with fresh server processes,
+alternating forward/reverse target order between forks. It freezes and hashes the
+harness executable, load generator, Java jar, native library when required, and
+exported corpus.
 It retains client/server logs, commands, versions, host load, process snapshots,
 listener ownership, shutdown evidence, fixture execution counters, and the
 planning profile's zero-Spark-jobs audit.
+
+The frozen executable at `artifacts/harness` contains the runner and reporter.
+Rust manifests set `metadata.orchestration` to `rust`, and their `runner_sha256`
+and `reporter_sha256` both identify those executable bytes. Reports retain the
+actual reporting executable's hash in `analysis_reporter_sha256`. Use the frozen
+copy to regenerate a report with the original producer; the comparator requires
+that identity to match. The Rust reporter can also read legacy Python manifests
+and validate their original script hashes.
 
 The reporter writes `REPORT.md`, `summary.json`, `cells.csv`, and
 `comparisons.csv`. Accepted forks include median/p95/p99, first-message and
@@ -156,10 +181,12 @@ performance and retains failed controls. No performance improvement is assumed.
 
 ## Build and run
 
-Run commands from the repository root. Use Rust 1.88 or newer,
-`protoc`, Python 3.9 or newer, JDK 21, and a matching Spark 4.2 assembly containing
-the shaded Connect gRPC jars. The JNI engine uses Spark internal APIs pinned to
-the assembly documented in the main README; other versions may require changes.
+Run commands from the repository root. Use Rust 1.88 or newer and `protoc`.
+`suite` and `compare` process-group orchestration support macOS and Linux.
+JVM targets additionally require JDK 21 and a matching Spark 4.2 assembly
+containing the shaded Connect gRPC jars. The JNI engine uses Spark internal APIs
+pinned to the assembly documented in the main README; other versions may require
+changes. A `--targets rust-fixture` suite needs neither JDK nor Spark.
 
 ```sh
 export JAVA_HOME=/path/to/jdk-21
@@ -175,31 +202,33 @@ Use `libspark_connect_jni.so` on Linux in place of the macOS
 Start with route/lifecycle validation for all four targets:
 
 ```sh
-python3 benchmarks/protocol/run.py --output /absolute/new-protocol-check \
+target/release/spark-connect-protocol-bench suite --output /absolute/new-protocol-check \
   --profile smoke --coverage-only --forks 1 \
   --spark-home "$SPARK_HOME" --java-home "$JAVA_HOME" \
   --library "$PWD/target/release/libspark_connect_jni.dylib"
-python3 benchmarks/protocol/report.py /absolute/new-protocol-check
+/absolute/new-protocol-check/artifacts/harness report --input /absolute/new-protocol-check
 ```
 
 A small timed smoke run exercises the full corpus and all sharing combinations:
 
 ```sh
-python3 benchmarks/protocol/run.py --output /absolute/new-protocol-smoke \
+target/release/spark-connect-protocol-bench suite --output /absolute/new-protocol-smoke \
   --profile smoke --forks 1 --concurrency 1,4 --requests 8 --warmups 4 --repetitions 1 \
+  --max-prepared-mib 60 \
   --spark-home "$SPARK_HOME" --java-home "$JAVA_HOME" \
   --library "$PWD/target/release/libspark_connect_jni.dylib"
-python3 benchmarks/protocol/report.py /absolute/new-protocol-smoke
+/absolute/new-protocol-smoke/artifacts/harness report --input /absolute/new-protocol-smoke
 ```
 
 For a larger comparison:
 
 ```sh
-python3 benchmarks/protocol/run.py --output /absolute/new-protocol-standard \
+target/release/spark-connect-protocol-bench suite --output /absolute/new-protocol-standard \
   --profile standard --forks 4 --concurrency 1,8,32 --requests 64 --warmups 16 --repetitions 3 \
+  --max-prepared-mib 60 \
   --spark-home "$SPARK_HOME" --java-home "$JAVA_HOME" \
   --library "$PWD/target/release/libspark_connect_jni.dylib"
-python3 benchmarks/protocol/report.py /absolute/new-protocol-standard
+/absolute/new-protocol-standard/artifacts/harness report --input /absolute/new-protocol-standard
 ```
 
 `--targets rust-fixture,jvm-fixture` runs just the synthetic comparison;
@@ -208,26 +237,38 @@ python3 benchmarks/protocol/report.py /absolute/new-protocol-standard
 `--payload-dir DIRECTORY` reuses an exported corpus, copied into the new result
 directory. The output directory must be new, and all servers bind to loopback.
 
-The Rust binary also supports `export`, `serve-fixture`, `run`, and `codec` for
-manual experiments. `codec` records local protobuf encode/decode costs without a
-server; it is a separate measurement and is never subtracted from RPC timings.
-
-Reporter regression tests run without a server:
+The binary also supports `export`, `serve-fixture`, `run`, and `codec` for manual
+experiments. `codec` records local protobuf encode/decode costs without a server;
+it is a separate measurement and is never subtracted from RPC timings. Audit the
+unmodified official API output without starting a server:
 
 ```sh
-python3 -m unittest discover -s benchmarks/protocol/tests -p 'test_*.py'
+target/release/spark-connect-protocol-bench api-audit --output results/rust-api-audit.json
+```
+
+Add `--strict` to make observed client gaps a nonzero exit status. The pinned
+revision currently has an observed typed-array annotation gap, so a strict audit
+is expected to fail until that contract changes.
+
+Rust runner, reporter, comparator, and API-audit regression tests run without
+starting Spark or a JVM:
+
+```sh
+cargo test --locked --manifest-path benchmarks/protocol/Cargo.toml --target-dir target --lib
 ```
 
 ## Compare native engine builds with RSI
 
-`compare.py` runs the production `rust-jvm-planning` target with two saved jar and
-native-library pairs. Both variants keep that target name. The wrapper copies
-the original runner, reporter, load generator, corpus, policy, and artifacts;
+`compare` runs the production `rust-jvm-planning` target with two saved jar and
+native-library pairs. Both variants keep that target name. The Rust coordinator
+copies the harness executable, load generator, corpus, policy, and artifacts;
 checks their hashes before and after each child; and alternates fresh JVMs in
-AB/BA order. Save both builds outside the build output directory before running.
+AB/BA order. It launches the frozen executable's `suite` and `report` commands
+and validates each summary's reporting identity. Save both builds outside the
+build output directory before running.
 
 ```sh
-python3 benchmarks/protocol/compare.py --output /absolute/new-engine-comparison \
+target/release/spark-connect-protocol-bench compare --output /absolute/new-engine-comparison \
   --baseline-jar /absolute/baseline/bridge.jar \
   --baseline-library /absolute/baseline/libspark_connect_jni.dylib \
   --candidate-jar /absolute/candidate/bridge.jar \
