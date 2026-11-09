@@ -16,7 +16,7 @@ use std::{
 
 fn help() {
     println!(
-        r#"Spark Connect protocol concurrency benchmark (official Rust client/protobufs)
+        r#"Spark Connect protocol concurrency benchmark (pinned fork Rust client/protobufs)
 
 suite --output DIRECTORY [--targets rust-fixture,jvm-fixture,jvm-planning,rust-jvm-planning]
     [--profile smoke|standard|stress] [--forks 2] [--concurrency 1,8,32]

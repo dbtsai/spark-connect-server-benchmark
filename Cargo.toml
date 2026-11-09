@@ -7,7 +7,7 @@ license = "Apache-2.0"
 description = "Experimental Spark Connect server with DataFusion and Spark JVM backends"
 
 [dependencies]
-spark-connect-proto = { package = "apache-spark-connect-proto", git = "https://github.com/apache/spark-connect-rust.git", rev = "9ed82b874357cdff887977864026d98f8b00f434" }
+spark-connect-proto = { package = "apache-spark-connect-proto", git = "https://github.com/dbtsai/spark-connect-rust.git", rev = "87b2b1e817e7384ed63e8b2385f4b5e4a51ad7ce" }
 arrow = { version = "58", default-features = false, features = ["ipc"] }
 datafusion = { version = "53", default-features = false, features = ["sql"] }
 futures = "0.3"
@@ -26,7 +26,7 @@ tonic-build = "0.14"
 
 [dev-dependencies]
 h2 = "0.4"
-spark-connect = { package = "apache-spark-connect", git = "https://github.com/apache/spark-connect-rust.git", rev = "9ed82b874357cdff887977864026d98f8b00f434" }
+spark-connect = { package = "apache-spark-connect", git = "https://github.com/dbtsai/spark-connect-rust.git", rev = "87b2b1e817e7384ed63e8b2385f4b5e4a51ad7ce" }
 
 [profile.dev]
 debug = 0

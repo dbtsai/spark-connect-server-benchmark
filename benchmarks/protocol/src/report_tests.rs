@@ -442,6 +442,180 @@ fn unsupported_capability_requires_no_timed_cells() {
         .push(cell("unavailable", 100, 1000, 0));
     f.invalid();
 }
+
+#[test]
+fn legacy_rust_status_timing_survives_unsupported_jvm_status_with_prost_provenance() {
+    let mut fixture = Fixture::new();
+    let mut status = cell("protocol/get_status", 100, 1000, 0);
+    status["workload"] = json!("GetStatus");
+    fixture.rust()["cells"].as_array_mut().unwrap().push(status);
+    fixture.rust()["settings"]["official_rust_revision"] = json!("legacy-client-pin");
+    for (target, supported) in [("fork1-rust-fixture", true), ("fork1-jvm-fixture", false)] {
+        fixture.clients.get_mut(target).unwrap()["capabilities"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"case":"protocol/get_status","rpc":"GetStatus","supported":supported}));
+    }
+    // The legacy JVM fixture did not have this route or descriptor at all.
+    let jvm_status_probe = fixture.jvm()["coverage"]["records"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|record| record["route"] == "GetStatus")
+        .unwrap();
+    jvm_status_probe["supported"] = json!(false);
+    jvm_status_probe["status"] = json!("UNIMPLEMENTED");
+    fixture.manifest["runs"][0]["shutdown"]["fixture_stats"]["calls"]["GetStatus"] = json!(5);
+    // The recorded client pin applies to both targets in the same historical suite.
+    fixture.jvm()["settings"]["official_rust_revision"] = json!("legacy-client-pin");
+    let result = fixture.summary();
+    assert_eq!(result["valid"], true, "{}", result["errors"]);
+    assert!(result["comparisons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|item| item["workload"] != "GetStatus"));
+    let rust = result["forks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|fork| fork["target"] == "rust-fixture")
+        .unwrap();
+    let group = rust["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|group| group["workload"] == "GetStatus")
+        .unwrap();
+    assert_eq!(group["protocol_implementation"]["server_codec"], "prost");
+    assert!(group["protocol_implementation"]["descriptor_source"]
+        .as_str()
+        .unwrap()
+        .contains("legacy-client-pin"));
+    let capability = rust["client_metadata"]["capabilities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|capability| capability["rpc"] == "GetStatus")
+        .unwrap();
+    assert_eq!(
+        capability["protocol_implementation"],
+        group["protocol_implementation"]
+    );
+    fixture.manifest["runs"][0]["shutdown"]["fixture_stats"]
+        .as_object_mut()
+        .unwrap()
+        .remove("calls");
+    let invalid = fixture.invalid();
+    assert!(invalid["errors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|error| text(error).contains("GetStatus calls")));
+}
+
+fn status_fixture() -> Fixture {
+    let mut fixture = Fixture::new();
+    for client in fixture.clients.values_mut() {
+        client["settings"]["fixture_get_status_required"] = json!(true);
+        client["capabilities"] =
+            json!([{"case":"protocol/get_status","rpc":"GetStatus","supported":true}]);
+        client["cells"][0]["case"] = json!("protocol/get_status");
+        client["cells"][0]["workload"] = json!("GetStatus");
+    }
+    for record in fixture.manifest["runs"].as_array_mut().unwrap() {
+        record["shutdown"]["fixture_stats"]["calls"]["GetStatus"] = json!(9);
+        if record["target"] == "jvm-fixture" {
+            record["shutdown"]["fixture_stats"]["get_status_descriptor"] =
+                json!("test official schema; fixture compatibility; dynamic protobuf marshalling");
+        }
+    }
+    fixture
+}
+
+#[test]
+fn get_status_timings_and_capabilities_identify_dynamic_compatibility() {
+    let fixture = status_fixture();
+    let result = fixture.summary();
+    assert_eq!(result["valid"], true, "{}", result["errors"]);
+    let comparison = &result["comparisons"][0];
+    close(&comparison["latency_ratio"]["geometric_mean"], 0.5);
+    close(&comparison["throughput_ratio"]["geometric_mean"], 2.0);
+    assert_eq!(
+        comparison["protocol_implementation"]["like_for_like_generated_code"],
+        false
+    );
+    assert_eq!(
+        comparison["protocol_implementation"]["reference_codec"],
+        "shaded protobuf DynamicMessage"
+    );
+    for fork in result["forks"].as_array().unwrap() {
+        let group = &fork["groups"][0]["protocol_implementation"];
+        let capability = &fork["client_metadata"]["capabilities"][0]["protocol_implementation"];
+        assert_eq!(group, capability);
+        let codec = if fork["target"] == "jvm-fixture" {
+            assert!(group["descriptor_source"]
+                .as_str()
+                .unwrap()
+                .contains("dynamic protobuf marshalling"));
+            "shaded protobuf DynamicMessage"
+        } else {
+            "prost"
+        };
+        assert_eq!(group["server_codec"], codec);
+    }
+    let rendered = markdown(&result);
+    assert!(rendered.contains("GetStatus compatibility: prost / DynamicMessage"));
+    assert!(rendered.contains("GetStatus compatibility: shaded protobuf DynamicMessage"));
+    write_csvs(&fixture.directory, &result).unwrap();
+    for name in ["cells.csv", "comparisons.csv"] {
+        let csv = fs::read_to_string(fixture.directory.join(name)).unwrap();
+        assert!(csv
+            .lines()
+            .next()
+            .unwrap()
+            .contains("protocol_implementation"));
+        assert!(csv.contains("DynamicMessage"));
+    }
+}
+
+#[test]
+fn supported_get_status_requires_server_calls_and_descriptor_evidence() {
+    for field in ["calls", "get_status_descriptor"] {
+        let mut fixture = status_fixture();
+        fixture.manifest["runs"][1]["shutdown"]["fixture_stats"]
+            .as_object_mut()
+            .unwrap()
+            .remove(field);
+        let result = fixture.invalid();
+        assert!(result["errors"].as_array().unwrap().iter().any(|error| {
+            text(error).contains(if field == "calls" {
+                "GetStatus calls"
+            } else {
+                "descriptor provenance"
+            })
+        }));
+    }
+}
+
+#[test]
+fn new_fixture_contract_rejects_unimplemented_get_status_capability_and_probe() {
+    let mut fixture = status_fixture();
+    fixture.jvm()["capabilities"][0]["supported"] = json!(false);
+    fixture.jvm()["cells"] = json!([]);
+    fixture.invalid();
+
+    let mut fixture = status_fixture();
+    let record = fixture.jvm()["coverage"]["records"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|record| record["route"] == "GetStatus")
+        .unwrap();
+    record["supported"] = json!(false);
+    record["status"] = json!("UNIMPLEMENTED");
+    fixture.invalid();
+}
 #[test]
 fn explicit_skip_completes_requested_grid() {
     let mut f = Fixture::new();

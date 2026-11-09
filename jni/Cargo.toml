@@ -15,7 +15,7 @@ spark-connect-server = { path = ".." }
 futures = "0.3"
 arrow = { version = "58", default-features = false, features = ["ipc", "ffi"] }
 prost = "0.14"
-spark-connect-proto = { package = "apache-spark-connect-proto", git = "https://github.com/apache/spark-connect-rust.git", rev = "9ed82b874357cdff887977864026d98f8b00f434" }
+spark-connect-proto = { package = "apache-spark-connect-proto", git = "https://github.com/dbtsai/spark-connect-rust.git", rev = "87b2b1e817e7384ed63e8b2385f4b5e4a51ad7ce" }
 libc = "0.2"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time"] }
 tonic = "0.14"

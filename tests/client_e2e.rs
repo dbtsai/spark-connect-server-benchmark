@@ -150,7 +150,7 @@ fn range_transformations_and_aggregates() {
         vec![10]
     );
     let star = spark_connect::Column::new(spark_connect::Expression::new(
-        spark_connect::expression::ExpressionNode::UnresolvedStar(None),
+        spark_connect::expression::ExpressionNode::UnresolvedStar(None, None),
     ));
     assert_eq!(
         integers(&range.agg(vec![f::count(star).expression().clone()])),

@@ -6,9 +6,21 @@ correctness checks, confirmation, and broader coverage.
 
 The `spark-connect-protocol-bench` executable owns `suite`, `report`, `compare`,
 and `api-audit`; its public Rust library exposes the same implementation. Corpus
-plans originate from the official Rust public APIs, with generated protobuf/gRPC
-bindings used for route probes. Run `api-audit` to inspect unmodified API output
-and keep observed gaps separate from declared corpus compatibility corrections.
+plans originate from the pinned Rust client's public APIs, with generated
+protobuf/gRPC bindings used for route probes. Run `api-audit` to inspect unmodified
+API output and keep active client gaps separate from resolved serialization
+contracts.
+The pin `87b2b1e817e7384ed63e8b2385f4b5e4a51ad7ce` includes
+upstream array-literal fix SPARK-61119,
+[`70688ec07ff87ea5cd4d685247074feeaa2c2b7f`](https://github.com/apache/spark-connect-rust/commit/70688ec07ff87ea5cd4d685247074feeaa2c2b7f),
+and Arrow map-import normalization from the
+[complete fork diff](https://github.com/dbtsai/spark-connect-rust/compare/925dc876f63f1f779fe176f62575a0aa96cc6886...87b2b1e817e7384ed63e8b2385f4b5e4a51ad7ce).
+The map fix is proposed upstream in
+[PR #396](https://github.com/apache/spark-connect-rust/pull/396)
+([SPARK-61212](https://issues.apache.org/jira/browse/SPARK-61212)) and is not merged.
+Typed literals use unmodified client output; map-import evidence comes from the
+public session API's serialized IPC schema. Audit-only probes preserve timed
+case counts and the 12-route inventory.
 See [Rust API gaps](RUST_API_GAPS.md) for evidence and scope. This execution-free
 workflow requires no Python; the optional [executed-query profile](../README.md)
 and Python acceptance checks remain independent holdouts.
@@ -31,8 +43,9 @@ and Python acceptance checks remain independent holdouts.
 6. Evaluate each case, including primary and completed-round rates. Count distinct
    case/concurrency targets; sharing topologies cannot inflate that count.
 7. Repeat a promising result in a new output directory starting in the opposite
-   order. Run [sharing](policies/sharing.json), [bounded standard](policies/standard.json),
-   and executed-query/cancellation/Arrow holdouts before promotion.
+   order. Run [sharing](policies/sharing.json),
+   [bounded standard](policies/standard.json), and
+   executed-query/cancellation/Arrow holdouts before promotion.
 8. Keep an experiment ledger with the hypothesis, exact patch, commands,
    correctness results, all timing samples, and keep/revert decision. Declare a
    finite experiment budget. An inconclusive result remains inconclusive.
@@ -75,13 +88,16 @@ reproducible standalone reporting:
 
 ```sh
 results/example-suite/artifacts/harness report --input results/example-suite
-target/release/spark-connect-protocol-bench api-audit --output results/rust-api-audit.json
+target/release/spark-connect-protocol-bench api-audit --strict --output results/rust-api-audit.json
 cargo test --locked --manifest-path benchmarks/protocol/Cargo.toml --target-dir target --lib
 ```
 
 The tests exercise orchestration, reporting, comparisons, and API contracts
-without Spark servers. `api-audit --strict` returns nonzero while a documented
-observed gap remains; it is separate from benchmark validity.
+without Spark servers. `api-audit --strict` rejects observed regressions in the
+array-element or public Arrow map-import contracts; it is separate from benchmark
+validity. Regenerate the frozen corpus and rerun controls after changing the
+client revision. Historical results retain their original dependency and corpus
+hashes.
 
 ## Candidate and confirmation
 

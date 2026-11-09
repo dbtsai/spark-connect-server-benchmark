@@ -49,7 +49,7 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 [[package]]
 name = "apache-spark-connect-proto"
 version = "4.3.0"
-source = "git+https://github.com/apache/spark-connect-rust.git?rev=9ed82b874357cdff887977864026d98f8b00f434#9ed82b874357cdff887977864026d98f8b00f434"
+source = "git+https://github.com/dbtsai/spark-connect-rust.git?rev=87b2b1e817e7384ed63e8b2385f4b5e4a51ad7ce#87b2b1e817e7384ed63e8b2385f4b5e4a51ad7ce"
 dependencies = [
  "prost",
  "prost-types",

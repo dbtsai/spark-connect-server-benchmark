@@ -20,8 +20,17 @@ use uuid::Uuid;
 
 type Client = SparkConnectServiceClient<Channel>;
 const MAX_MESSAGE: usize = 64 * 1024 * 1024;
-const CLIENT_TYPE: &str = "official-rust/protocol-bench";
+const CLIENT_TYPE: &str = "fork-pinned-rust/protocol-bench";
 const CONFIG_KEY: &str = "protocol.bench.value";
+
+fn get_status_compatibility(mode: &str, route: &str) -> Option<Value> {
+    (mode == "fixture" && route == "GetStatus").then(|| {
+        json!({"scope":"synthetic GetStatus compatibility",
+            "codecs":"Rust fixture: prost; JVM fixture: shaded protobuf DynamicMessage",
+            "descriptor_provenance":"JVM shutdown.fixture_stats.get_status_descriptor",
+            "production_spark_frontend_comparison":false})
+    })
+}
 
 #[derive(Clone, Debug)]
 pub struct Settings {
@@ -41,6 +50,20 @@ pub struct Settings {
     pub case_filter: Option<String>,
     pub coverage_only: bool,
     pub max_prepared_bytes: usize,
+}
+
+fn settings_metadata(settings: &Settings) -> Value {
+    // Retain the legacy key as an alias for old consumers. It identifies the
+    // actual fork pin; official_base_revision identifies its upstream base.
+    json!({
+        "endpoint":settings.endpoint,"profile":settings.profile,"coverage_only":settings.coverage_only,"requests":settings.requests,"warmups":settings.warmups,"repetitions":settings.repetitions,"concurrency":settings.concurrency,"session_models":settings.session_models,"channel_models":settings.channel_models,"client_threads":settings.client_threads,"timeout_seconds":settings.timeout.as_secs_f64(),"case_filter":settings.case_filter,"max_prepared_bytes":settings.max_prepared_bytes,"closed_loop":true,"retries":0,"no_execution":true,"plan_building_outside_timing":true,"validation_outside_timing":true,"cleanup_outside_timing":true,
+        "client_origin":"fork-pinned Rust client","client_revision":crate::api_audit::CLIENT_REVISION,
+        "official_base_revision":crate::api_audit::OFFICIAL_BASE_REVISION,
+        "official_rust_revision":crate::api_audit::CLIENT_REVISION,
+        "official_rust_revision_alias_for":"client_revision",
+        "protocol_version":"4.3.0","fixture_get_status_required":settings.mode=="fixture",
+        "primary_rpc_allowlist":if settings.mode=="planning"{vec!["AnalyzePlan","Config"]}else{vec!["ExecutePlan","AnalyzePlan","Config","AddArtifacts","ArtifactStatus","Interrupt","ReattachExecute","ReleaseExecute","ReleaseSession","FetchErrorDetails","CloneSession","GetStatus"]}
+    })
 }
 #[derive(Clone)]
 struct Payload {
@@ -1223,6 +1246,7 @@ async fn validate_round(
     workers: &mut [Worker],
     timeout: Duration,
     resources: &Resources,
+    support_required: bool,
 ) -> (
     Vec<String>,
     Vec<String>,
@@ -1240,7 +1264,7 @@ async fn validate_round(
     for sample in &mut round.samples {
         let status = sample.result.as_ref().err().map_or(Code::Ok, Status::code);
         *codes.entry(format!("{status:?}")).or_default() += 1;
-        if status == Code::Unimplemented {
+        if status == Code::Unimplemented && !support_required {
             unsupported += 1;
         } else if let Err(e) = check(sample) {
             failures += 1;
@@ -1320,9 +1344,7 @@ async fn run_inner(settings: &Settings, resources: &Resources) -> Result<Value, 
         settings.timeout,
     )
     .await?;
-    let mut report = json!({"schema_version":1,"mode":settings.mode,"passed":coverage["passed"]==true,"settings":{
-        "endpoint":settings.endpoint,"profile":settings.profile,"coverage_only":settings.coverage_only,"requests":settings.requests,"warmups":settings.warmups,"repetitions":settings.repetitions,"concurrency":settings.concurrency,"session_models":settings.session_models,"channel_models":settings.channel_models,"client_threads":settings.client_threads,"timeout_seconds":settings.timeout.as_secs_f64(),"case_filter":settings.case_filter,"max_prepared_bytes":settings.max_prepared_bytes,"closed_loop":true,"retries":0,"no_execution":true,"plan_building_outside_timing":true,"validation_outside_timing":true,"cleanup_outside_timing":true,
-        "official_rust_revision":"9ed82b874357cdff887977864026d98f8b00f434","protocol_version":"4.3.0","primary_rpc_allowlist":if settings.mode=="planning"{vec!["AnalyzePlan","Config"]}else{vec!["ExecutePlan","AnalyzePlan","Config","AddArtifacts","ArtifactStatus","Interrupt","ReattachExecute","ReleaseExecute","ReleaseSession","FetchErrorDetails","CloneSession","GetStatus"]}},"coverage":coverage,"capabilities":[],"skipped_cells":[],"cells":[]});
+    let mut report = json!({"schema_version":1,"mode":settings.mode,"passed":coverage["passed"]==true,"settings":settings_metadata(settings),"coverage":coverage,"capabilities":[],"skipped_cells":[],"cells":[]});
     save(&settings.output, &report)?;
     if !settings.coverage_only {
         for case in cases {
@@ -1331,10 +1353,17 @@ async fn run_inner(settings: &Settings, resources: &Resources) -> Result<Value, 
             let mut probe_workers = workers(settings, 1, "shared", "shared", resources).await?;
             let mut probe =
                 round(&mut probe_workers, &case, &payloads, 1, settings, resources).await?;
-            let (validation, mut clean, ok, failures, unsupported, _) =
-                validate_round(&mut probe, &mut probe_workers, settings.timeout, resources).await;
+            let (validation, mut clean, ok, failures, unsupported, _) = validate_round(
+                &mut probe,
+                &mut probe_workers,
+                settings.timeout,
+                resources,
+                settings.mode == "fixture" && case.route == "GetStatus",
+            )
+            .await;
             clean.extend(close_workers(&mut probe_workers, settings.timeout, resources).await);
-            let capability = json!({"case":case.name,"rpc":case.route,"supported":ok==1,"unsupported":unsupported,"validation_errors":validation,"cleanup_errors":clean});
+            let compatibility = get_status_compatibility(&settings.mode, case.route);
+            let capability = json!({"case":case.name,"rpc":case.route,"supported":ok==1,"unsupported":unsupported,"validation_errors":validation,"cleanup_errors":clean,"protocol_implementation":compatibility});
             report["capabilities"]
                 .as_array_mut()
                 .unwrap()
@@ -1399,6 +1428,7 @@ async fn run_inner(settings: &Settings, resources: &Resources) -> Result<Value, 
                                     &mut workers,
                                     settings.timeout,
                                     resources,
+                                    settings.mode == "fixture" && case.route == "GetStatus",
                                 )
                                 .await;
                             drop(warmup);
@@ -1449,6 +1479,7 @@ async fn run_inner(settings: &Settings, resources: &Resources) -> Result<Value, 
                                 &mut workers,
                                 settings.timeout,
                                 resources,
+                                settings.mode == "fixture" && case.route == "GetStatus",
                             )
                             .await;
                             cleanup_errors.extend(
@@ -1464,7 +1495,7 @@ async fn run_inner(settings: &Settings, resources: &Resources) -> Result<Value, 
                             {
                                 report["passed"] = json!(false);
                             }
-                            report["cells"].as_array_mut().unwrap().push(json!({"case":case.name,"workload":case.route,"metadata":case.metadata,"session_model":session_model,"channel_model":channel_model,"concurrency":concurrency,"repetition":repetition,"requests":settings.requests,"warmup_requests":warmup_count,"successes":successes,"failures":failures,"unsupported":unsupported,"elapsed_ns":measured.elapsed_ns,"preparation_ns":measured.preparation_ns,"full_round_elapsed_ns":measured.preparation_ns.saturating_add(measured.elapsed_ns).saturating_add(validation_cleanup_ns),"latencies_ns":latencies,"first_message_latencies_ns":first,"first_arrow_latencies_ns":first_arrow,"request_bytes":request_bytes,"response_bytes":response_bytes,"byte_accounting":"protobuf encoded bytes, excluding gRPC/HTTP2 framing","status_counts":status_counts,"validation_errors":errors,"cleanup_errors":cleanup_errors,"warmup_validation_errors":warm_errors,"warmup_cleanup_errors":warm_cleanup,"client_cpu_ns":measured.cpu_ns,"validation_cleanup_ns":validation_cleanup_ns,"latency_window":"primary_rpc_drain_including_client_encode","throughput_window":"primary_rpc_round_excluding_preparation_validation_cleanup"}));
+                            report["cells"].as_array_mut().unwrap().push(json!({"case":case.name,"workload":case.route,"metadata":case.metadata,"protocol_implementation":compatibility,"session_model":session_model,"channel_model":channel_model,"concurrency":concurrency,"repetition":repetition,"requests":settings.requests,"warmup_requests":warmup_count,"successes":successes,"failures":failures,"unsupported":unsupported,"elapsed_ns":measured.elapsed_ns,"preparation_ns":measured.preparation_ns,"full_round_elapsed_ns":measured.preparation_ns.saturating_add(measured.elapsed_ns).saturating_add(validation_cleanup_ns),"latencies_ns":latencies,"first_message_latencies_ns":first,"first_arrow_latencies_ns":first_arrow,"request_bytes":request_bytes,"response_bytes":response_bytes,"byte_accounting":"protobuf encoded bytes, excluding gRPC/HTTP2 framing","status_counts":status_counts,"validation_errors":errors,"cleanup_errors":cleanup_errors,"warmup_validation_errors":warm_errors,"warmup_cleanup_errors":warm_cleanup,"client_cpu_ns":measured.cpu_ns,"validation_cleanup_ns":validation_cleanup_ns,"latency_window":"primary_rpc_drain_including_client_encode","throughput_window":"primary_rpc_round_excluding_preparation_validation_cleanup"}));
                             save(&settings.output, &report)?;
                         }
                     }
@@ -1503,11 +1534,67 @@ mod tests {
             .collect::<HashSet<_>>();
         assert_eq!(variants.len(), 7);
     }
-    #[test]
-    fn planning_case_allowlist_cannot_dispatch_execution() {
-        let s = Settings {
+
+    #[tokio::test]
+    async fn required_fixture_status_unimplemented_is_a_validation_failure() {
+        let session = Session {
+            id: Uuid::new_v4().to_string(),
+            server_id: Uuid::new_v4().to_string(),
+        };
+        let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let mut workers = [Worker {
+            client: Client::new(channel),
+            session: session.clone(),
+        }];
+        let sample = || Sample {
+            prepared: Prepared {
+                input: None,
+                identity: Identity {
+                    session: session.clone(),
+                },
+                expected: Expected::Status,
+                cleanup_op: None,
+                cleanup_session: None,
+                held: None,
+                request_bytes: 0,
+            },
+            result: Err(Status::unimplemented("fixture route disappeared")),
+            elapsed_ns: 1,
+            first_ns: None,
+            first_arrow_ns: None,
+            response_bytes: 0,
+        };
+        for (required, expected_failures, expected_unsupported) in [(true, 1, 0), (false, 0, 1)] {
+            let mut round = Round {
+                samples: vec![sample()],
+                preparation_ns: 0,
+                elapsed_ns: 1,
+                cpu_ns: 0,
+            };
+            let (errors, cleanup, successes, failures, unsupported, codes) = validate_round(
+                &mut round,
+                &mut workers,
+                Duration::from_secs(1),
+                &Resources::default(),
+                required,
+            )
+            .await;
+            assert_eq!(
+                (successes, failures, unsupported),
+                (0, expected_failures, expected_unsupported)
+            );
+            assert_eq!(errors.len(), expected_failures);
+            assert!(cleanup.is_empty());
+            assert_eq!(codes.get("Unimplemented"), Some(&1));
+        }
+        let annotation = get_status_compatibility("fixture", "GetStatus").unwrap();
+        assert_eq!(annotation["production_spark_frontend_comparison"], false);
+        assert!(get_status_compatibility("planning", "GetStatus").is_none());
+    }
+    fn test_settings(mode: &str) -> Settings {
+        Settings {
             endpoint: String::new(),
-            mode: "planning".into(),
+            mode: mode.into(),
             profile: "smoke".into(),
             payload_dir: PathBuf::new(),
             output: PathBuf::new(),
@@ -1522,7 +1609,36 @@ mod tests {
             case_filter: None,
             coverage_only: false,
             max_prepared_bytes: 1 << 20,
-        };
+        }
+    }
+
+    #[test]
+    fn report_settings_identify_fork_pin_upstream_base_and_legacy_alias() {
+        for mode in ["fixture", "planning"] {
+            let metadata = settings_metadata(&test_settings(mode));
+            assert_eq!(
+                metadata["client_revision"],
+                crate::api_audit::CLIENT_REVISION
+            );
+            assert_eq!(
+                metadata["official_rust_revision"],
+                crate::api_audit::CLIENT_REVISION
+            );
+            assert_eq!(
+                metadata["official_base_revision"],
+                crate::api_audit::OFFICIAL_BASE_REVISION
+            );
+            assert_eq!(
+                metadata["official_rust_revision_alias_for"],
+                "client_revision"
+            );
+            assert_eq!(metadata["fixture_get_status_required"], mode == "fixture");
+        }
+    }
+
+    #[test]
+    fn planning_case_allowlist_cannot_dispatch_execution() {
+        let s = test_settings("planning");
         let result = cases(&s, corpus::build("smoke").unwrap(), &[]);
         assert!(result
             .iter()

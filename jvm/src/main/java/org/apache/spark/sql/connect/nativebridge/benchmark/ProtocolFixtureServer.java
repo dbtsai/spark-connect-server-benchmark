@@ -38,6 +38,7 @@ import org.sparkproject.connect.grpc.netty.NettyServerBuilder;
 import org.sparkproject.connect.grpc.stub.ServerCallStreamObserver;
 import org.sparkproject.connect.grpc.stub.StreamObserver;
 import org.sparkproject.connect.protobuf.ByteString;
+import org.sparkproject.connect.protobuf.DynamicMessage;
 
 /**
  * Synthetic protocol fixture using Spark's generated protobuf and shaded gRPC stack.
@@ -92,7 +93,8 @@ public final class ProtocolFixtureServer extends SparkConnectServiceGrpc.SparkCo
     };
     Server server = NettyServerBuilder.forAddress(new InetSocketAddress("127.0.0.1", port))
         .executor(workers).maxInboundMessageSize((int) MAX_BYTES)
-        .maxConcurrentCallsPerConnection(1024).intercept(selection).addService(fixture).build().start();
+        .maxConcurrentCallsPerConnection(1024).intercept(selection)
+        .addService(GetStatusCompat.bind(fixture.bindService(), fixture::getStatus)).build().start();
     Runtime.getRuntime().addShutdownHook(new Thread(() -> {
       server.shutdownNow();
       try { server.awaitTermination(5, TimeUnit.SECONDS); }
@@ -700,6 +702,32 @@ public final class ProtocolFixtureServer extends SparkConnectServiceGrpc.SparkCo
     });
   }
 
+  private void getStatus(DynamicMessage message, StreamObserver<DynamicMessage> observer) {
+    unary("GetStatus", observer, () -> {
+      GetStatusCompat.Input input = new GetStatusCompat.Input(message);
+      Session session = session(input.user, input.hasUser, input.session, input.observed, input.hasObserved);
+      Map<String, Integer> statuses = new LinkedHashMap<>();
+      synchronized (session) {
+        session.ensureOpen();
+        if (input.hasOperationStatus) {
+          List<String> selected = input.operationIds;
+          if (selected.isEmpty()) {
+            // Fixture determinism: Spark's all-ID response does not promise sorting.
+            // See benchmarks/protocol/GETSTATUS_CONTRACT.md for lifecycle differences.
+            selected = new ArrayList<>(session.operations.keySet());
+            Collections.sort(selected);
+          }
+          for (String id : selected) {
+            Operation operation = session.operations.get(id);
+            statuses.putIfAbsent(id,
+                operation == null ? 1 : operation.cancelled ? 6 : operation.hold ? 2 : 4);
+          }
+        }
+      }
+      return GetStatusCompat.response(session.id, statuses);
+    });
+  }
+
   private synchronized Map<String, Object> stats() {
     Map<String, Object> result = new LinkedHashMap<>();
     result.put("profile", "synthetic-protocol-fixture"); result.put("query_executions", 0);
@@ -714,7 +742,8 @@ public final class ProtocolFixtureServer extends SparkConnectServiceGrpc.SparkCo
     Map<String, Long> count = new LinkedHashMap<>();
     calls.forEach((name, value) -> count.put(name, value.get()));
     result.put("calls", count);
-    result.put("unavailable_routes", Collections.singletonList("GetStatus (Spark 4.2 generated service)"));
+    result.put("unavailable_routes", Collections.emptyList());
+    result.put("get_status_descriptor", GetStatusCompat.descriptorSource());
     return result;
   }
   private synchronized void shutdown() {

@@ -328,7 +328,8 @@ fn summarize_cells(cells: &[Value]) -> Result<Value, String> {
         "response_mib_per_s":if response_bytes == 0 { None } else { Some(response_bytes as f64*1e9/elapsed as f64/1_048_576.0) },
         "request_bytes":sum(cells,"request_bytes")?, "response_bytes":response_bytes, "client_cpu_ns":cpu, "client_cpu_wall_ratio":cpu as f64/elapsed as f64,
         "latency_window":cells[0]["latency_window"], "throughput_window":cells[0]["throughput_window"],
-        "byte_accounting":cells[0].get("byte_accounting").cloned().unwrap_or_else(|| json!("protobuf encoded bytes, excluding gRPC/HTTP2 framing")), "rounds":rounds}),
+        "byte_accounting":cells[0].get("byte_accounting").cloned().unwrap_or_else(|| json!("protobuf encoded bytes, excluding gRPC/HTTP2 framing")),
+        "protocol_implementation":cells[0]["protocol_implementation"], "rounds":rounds}),
     )
 }
 
@@ -428,6 +429,11 @@ fn validate_requested_grid(client: &Value, label: &str) -> Result<(), String> {
         let supported = capability["supported"]
             .as_bool()
             .ok_or_else(|| format!("{label} capability lacks explicit support status"))?;
+        if settings["fixture_get_status_required"] == true && rpc == "GetStatus" && !supported {
+            return Err(format!(
+                "{label} required fixture GetStatus capability is unavailable"
+            ));
+        }
         if cases.insert(case, (rpc, supported)).is_some() {
             return Err(format!("{label} contains duplicate capability cases"));
         }
@@ -585,6 +591,83 @@ fn validate_manifest_settings(
     Ok(())
 }
 
+fn annotate_fixture_get_status(
+    client: &mut Value,
+    record: &Value,
+    label: &str,
+) -> Result<(), String> {
+    if record["profile_kind"] != "fixture" {
+        return Ok(());
+    }
+    // Legacy fixtures could record GetStatus as unavailable without timing it.
+    // New load reports explicitly require support; supported/timed compatibility
+    // cells always require the observed server codec and descriptor provenance.
+    let status_measured_or_supported = client["cells"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|cell| cell["workload"] == "GetStatus")
+        || client["capabilities"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|capability| capability["rpc"] == "GetStatus" && capability["supported"] == true);
+    if client["settings"]["fixture_get_status_required"] != true && !status_measured_or_supported {
+        return Ok(());
+    }
+    let stats = &record["shutdown"]["fixture_stats"];
+    if stats["calls"]["GetStatus"].as_u64().unwrap_or(0) == 0 {
+        return Err(format!("{label} lacks observed fixture GetStatus calls"));
+    }
+    let (codec, descriptor) = if record["target"] == "jvm-fixture" {
+        let descriptor = string(
+            &stats["get_status_descriptor"],
+            "JVM GetStatus descriptor provenance",
+        )?;
+        if !descriptor.contains("dynamic protobuf marshalling") {
+            return Err(format!(
+                "{label} JVM GetStatus descriptor does not identify its DynamicMessage marshalling"
+            ));
+        }
+        ("shaded protobuf DynamicMessage", descriptor)
+    } else {
+        let origin = if client["settings"]["client_revision"].is_string() {
+            "fork-pinned Rust protocol crate"
+        } else {
+            "legacy pinned Rust protocol crate"
+        };
+        (
+            "prost",
+            format!(
+                "{origin}; revision {}",
+                client["settings"]["client_revision"]
+                    .as_str()
+                    .or_else(|| client["settings"]["official_rust_revision"].as_str())
+                    .unwrap_or("not recorded")
+            ),
+        )
+    };
+    let annotation = json!({"scope":"synthetic GetStatus compatibility", "server_codec":codec,
+        "descriptor_source":descriptor,"like_for_like_generated_code":false,
+        "production_spark_frontend_comparison":false});
+    for (field, route_field) in [("capabilities", "rpc"), ("cells", "workload")] {
+        if let Some(records) = client[field].as_array_mut() {
+            for entry in records
+                .iter_mut()
+                .filter(|entry| entry[route_field] == "GetStatus")
+            {
+                entry["protocol_implementation"] = annotation.clone();
+                if field == "cells" && truthy(&entry["unsupported"]) {
+                    return Err(format!(
+                        "{label} required fixture GetStatus timed call is unavailable"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn load_fork(directory: &Path, record: &Value) -> Result<Value, String> {
     object(record, "fork record")?;
     let label = record["fork_id"].as_str().unwrap_or("unnamed fork");
@@ -605,7 +688,7 @@ fn load_fork(directory: &Path, record: &Value) -> Result<Value, String> {
         return Err(format!("{label} client path escapes the run directory"));
     }
     let path = directory.join(relative);
-    let client = read_json(&path)?;
+    let mut client = read_json(&path)?;
     object(&client, "client result")?;
     if client["passed"] != true {
         return Err(format!(
@@ -620,6 +703,7 @@ fn load_fork(directory: &Path, record: &Value) -> Result<Value, String> {
             "{label} has incomplete work or final cleanup errors"
         ));
     }
+    annotate_fixture_get_status(&mut client, record, label)?;
     let settings = &client["settings"];
     if !settings.is_object() || settings["no_execution"] != true {
         return Err(format!("{label} lacks explicit execution-free settings"));
@@ -685,6 +769,20 @@ fn load_fork(directory: &Path, record: &Value) -> Result<Value, String> {
         if shutdown["fixture_stats"]["query_executions"] != 0 {
             return Err(format!("{label} lacks its no-query fixture audit"));
         }
+        if settings["fixture_get_status_required"] == true
+            && records.iter().any(|record| {
+                record
+                    .get("route")
+                    .or_else(|| record.get("rpc"))
+                    .and_then(Value::as_str)
+                    == Some("GetStatus")
+                    && record["supported"] != true
+            })
+        {
+            return Err(format!(
+                "{label} required fixture GetStatus probe is unavailable"
+            ));
+        }
     } else if shutdown["spark_job_audit"]["jobs_started"] != 0 {
         return Err(format!("{label} lacks its zero-Spark-jobs audit"));
     }
@@ -720,6 +818,7 @@ fn load_fork(directory: &Path, record: &Value) -> Result<Value, String> {
                 "status_counts",
                 "validation_errors",
                 "cleanup_errors",
+                "protocol_implementation",
             ]) {
                 outcome.insert(field.to_owned(), cell[field].clone());
             }
@@ -736,7 +835,12 @@ fn load_fork(directory: &Path, record: &Value) -> Result<Value, String> {
     }
     let mut groups = Vec::new();
     for (key, cells) in grouped {
-        for field in ["latency_window", "throughput_window", "byte_accounting"] {
+        for field in [
+            "latency_window",
+            "throughput_window",
+            "byte_accounting",
+            "protocol_implementation",
+        ] {
             if cells.iter().any(|c| c.get(field) != cells[0].get(field)) {
                 return Err(format!(
                     "{label} mixes timing windows within one cell group"
@@ -1015,6 +1119,11 @@ pub fn summarize(directory: &Path) -> Result<Value, String> {
                 }
                 let value = |g: &Value, field: &str| g[field].as_f64().unwrap_or(0.0);
                 let mut pair = json!({"fork":index, "native_fork":left["fork_id"], "reference_fork":right["fork_id"], "latency_ratio":value(l,"median_ms")/value(r,"median_ms"), "throughput_ratio":value(l,"requests_per_s")/value(r,"requests_per_s"), "native_median_ms":l["median_ms"], "reference_median_ms":r["median_ms"], "native_requests_per_s":l["requests_per_s"], "reference_requests_per_s":r["requests_per_s"]});
+                if key.1 == "GetStatus" && native == "rust-fixture" {
+                    pair["protocol_implementation"] = json!({"scope":"synthetic GetStatus compatibility",
+                        "native":l["protocol_implementation"], "reference":r["protocol_implementation"],
+                        "like_for_like_generated_code":false,"production_spark_frontend_comparison":false});
+                }
                 if !l["completed_round_requests_per_s"].is_null()
                     && !r["completed_round_requests_per_s"].is_null()
                 {
@@ -1036,6 +1145,11 @@ pub fn summarize(directory: &Path) -> Result<Value, String> {
     }
     let comparisons = comparisons.into_iter().map(|((native,reference,key),pairs)| {
         let mut item = with_key(json!({"native":native, "reference":reference, "pairs":pairs}),&key);
+        if key.1 == "GetStatus" && native == "rust-fixture" {
+            item["protocol_implementation"] = json!({"scope":"synthetic GetStatus compatibility",
+                "native_codec":"prost", "reference_codec":"shaded protobuf DynamicMessage",
+                "like_for_like_generated_code":false,"production_spark_frontend_comparison":false});
+        }
         for field in ["latency_ratio", "throughput_ratio", "completed_round_throughput_ratio"] {
             let values = item["pairs"].as_array().into_iter().flatten().filter_map(|p| p[field].as_f64()).collect::<Vec<_>>();
             if !values.is_empty() { item[field] = json!({"geometric_mean":(values.iter().map(|x|x.ln()).sum::<f64>()/values.len() as f64).exp(), "min":values.iter().copied().reduce(f64::min), "max":values.iter().copied().reduce(f64::max), "pairs":values.len()}); }
@@ -1064,7 +1178,7 @@ pub fn summarize(directory: &Path) -> Result<Value, String> {
         warnings.push("No matching target pairs: per-fork measurements are available without cross-target ratios.".into());
     }
     let mut summary = json!({"schema_version":1, "generated_at":now_utc(), "manifest_sha256":sha_file(&manifest_path)?, "analysis_reporter_sha256":reporter_hash()?, "harness_kind":"rust", "harness_version":1, "metadata":metadata, "valid":errors.is_empty(), "errors":errors, "warnings":warnings, "forks":forks, "comparisons":comparisons,
-        "methodology":{"independent_unit":"fresh server fork, matched within fork index", "latency":"descriptive per-fork pooled RPC latencies across repetitions of the same cell", "throughput":"successful requests / summed recorded primary-round elapsed time", "completed_round_throughput":"successful requests / summed preparation + primary RPC round + validation/cleanup time; excludes server startup, channel/session establishment, and warmups", "cross_fork_aggregation":"geometric mean and range of matched per-fork ratios", "unsupported":"never pooled with successful throughput or latency", "no_significance_claim":true}});
+        "methodology":{"independent_unit":"fresh server fork, matched within fork index", "latency":"descriptive per-fork pooled RPC latencies across repetitions of the same cell", "throughput":"successful requests / summed recorded primary-round elapsed time", "completed_round_throughput":"successful requests / summed preparation + primary RPC round + validation/cleanup time; excludes server startup, channel/session establishment, and warmups", "cross_fork_aggregation":"geometric mean and range of matched per-fork ratios", "unsupported":"never pooled with successful throughput or latency", "get_status":"synthetic compatibility cell: Rust prost versus JVM shaded protobuf DynamicMessage; not a like-for-like generated-code or production Spark frontend comparison", "no_significance_claim":true}});
     if let Some(corpus) = corpus {
         summary["corpus"] = corpus;
     }
@@ -1089,6 +1203,19 @@ fn display_optional(value: &Value, precision: usize) -> String {
         .unwrap_or_else(|| "—".into())
 }
 
+fn implementation_label(value: &Value) -> String {
+    let implementation = &value["protocol_implementation"];
+    if implementation["scope"] == "synthetic GetStatus compatibility" {
+        if let Some(codec) = implementation["server_codec"].as_str() {
+            format!("GetStatus compatibility: {codec}")
+        } else {
+            "GetStatus compatibility: prost / DynamicMessage".into()
+        }
+    } else {
+        "profile default".into()
+    }
+}
+
 fn markdown(summary: &Value) -> String {
     let forks = summary["forks"]
         .as_array()
@@ -1099,7 +1226,7 @@ fn markdown(summary: &Value) -> String {
         .map(Vec::as_slice)
         .unwrap_or(&[]);
     let mut lines = vec!["# Execution-free Spark Connect concurrency benchmark".into(), String::new(),
-        "This suite separates synthetic protocol handling from real-server planning. It uses the official Rust client's generated Spark Connect protocol; no throughput ratio crosses those two profiles.".into(), String::new(),
+        "This suite separates synthetic protocol handling from real-server planning. It uses the fork-pinned Rust client's generated Spark Connect protocol; no throughput ratio crosses those two profiles.".into(), String::new(),
         format!("Status: **{}**. Fresh server forks: {}.",if summary["valid"] == true { "valid" } else { "INVALID / incomplete" },forks.len()),String::new()];
     if let Some(errors) = summary["errors"].as_array().filter(|v| !v.is_empty()) {
         lines.extend(["## Validation failures".into(), String::new()]);
@@ -1108,11 +1235,12 @@ fn markdown(summary: &Value) -> String {
     }
     lines.extend(["## Matched concurrency cells".into(),String::new(),
         "Ratios are Rust/JVM within the same profile and cell: lower favors Rust for latency, higher favors Rust for request rate. Each pair uses separate fresh servers. The table shows geometric means and ranges across matched fork pairs; individual RPCs are not independent replications.".into(),String::new(),
-        "| Profile comparison | Case / primary RPC | Concurrency | Sessions / channels | Pairs | Median latency ratio GM [range] | Primary request-rate ratio GM [range] | Completed-round rate ratio GM [range] |".into(),
-        "| --- | --- | ---: | --- | ---: | ---: | ---: | ---: |".into()]);
+        "GetStatus fixture ratios retain the measured timings, but compare Rust prost with the JVM's shaded protobuf DynamicMessage compatibility route. They do not isolate generated-code performance or measure production Spark GetStatus. Descriptor provenance is retained per capability/cell in `summary.json`.".into(),String::new(),
+        "| Profile comparison | Case / primary RPC | Concurrency | Sessions / channels | Pairs | Median latency ratio GM [range] | Primary request-rate ratio GM [range] | Completed-round rate ratio GM [range] | Implementation scope |".into(),
+        "| --- | --- | ---: | --- | ---: | ---: | ---: | ---: | --- |".into()]);
     for item in comparisons.iter().take(200) {
         lines.push(format!(
-            "| {} / {} | {} / {} | {} | {} / {} | {} | {} | {} | {} |",
+            "| {} / {} | {} / {} | {} | {} / {} | {} | {} | {} | {} | {} |",
             esc(&item["native"]),
             esc(&item["reference"]),
             esc(&item["case"]),
@@ -1125,19 +1253,20 @@ fn markdown(summary: &Value) -> String {
             ratio(&item["throughput_ratio"]),
             item.get("completed_round_throughput_ratio")
                 .map(ratio)
-                .unwrap_or_else(|| "—".into())
+                .unwrap_or_else(|| "—".into()),
+            implementation_label(item)
         ));
     }
     if comparisons.is_empty() {
-        lines.push("| No matched successful cells | — | — | — | — | — | — | — |".into());
+        lines.push("| No matched successful cells | — | — | — | — | — | — | — | — |".into());
     }
     if comparisons.len() > 200 {
         lines.extend([String::new(),format!("Showing 200 of {} matched cell groups; `comparisons.csv` and `summary.json` contain every group.",comparisons.len())]);
     }
     lines.extend([String::new(),"## Per-fork measurements".into(),String::new(),
         "Only cells with every request successful, correct, and cleaned up appear here. p95/p99 are descriptive within each server fork. Primary rate uses the client's recorded primary-round window. Completed-round rate additionally includes request/lifecycle preparation and validation/cleanup; it excludes startup, channel/session establishment, and warmups. The report preserves each exact timing-window definition in `summary.json`.".into(),String::new(),
-        "| Fork | Case / RPC | Concurrency | Sessions / channels | Reps / requests | Median / p95 / p99 ms | Primary requests/s | Completed-round requests/s | Response MiB/s | Client CPU:wall |".into(),
-        "| --- | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |".into()]);
+        "| Fork | Case / RPC | Concurrency | Sessions / channels | Reps / requests | Median / p95 / p99 ms | Primary requests/s | Completed-round requests/s | Response MiB/s | Client CPU:wall | Implementation scope |".into(),
+        "| --- | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |".into()]);
     let mut shown = 0;
     let mut total = 0;
     for fork in forks {
@@ -1148,7 +1277,7 @@ fn markdown(summary: &Value) -> String {
             }
             shown += 1;
             lines.push(format!(
-                "| {} | {} / {} | {} | {} / {} | {} / {} | {} / {} / {} | {} | {} | {} | {} |",
+                "| {} | {} / {} | {} | {} / {} | {} / {} | {} / {} / {} | {} | {} | {} | {} | {} |",
                 esc(&fork["fork_id"]),
                 esc(&group["case"]),
                 esc(&group["workload"]),
@@ -1163,7 +1292,8 @@ fn markdown(summary: &Value) -> String {
                 display_optional(&group["requests_per_s"], 1),
                 display_optional(&group["completed_round_requests_per_s"], 1),
                 display_optional(&group["response_mib_per_s"], 2),
-                display_optional(&group["client_cpu_wall_ratio"], 3)
+                display_optional(&group["client_cpu_wall_ratio"], 3),
+                implementation_label(group)
             ));
         }
     }
@@ -1313,6 +1443,7 @@ fn write_csvs(directory: &Path, summary: &Value) -> Result<(), String> {
         "latency_window",
         "throughput_window",
         "byte_accounting",
+        "protocol_implementation",
     ];
     let mut cells = fields.join(",") + "\r\n";
     for fork in summary["forks"].as_array().into_iter().flatten() {
@@ -1341,6 +1472,7 @@ fn write_csvs(directory: &Path, summary: &Value) -> Result<(), String> {
         "completed_round_throughput_ratio_gm",
         "completed_round_throughput_ratio_min",
         "completed_round_throughput_ratio_max",
+        "protocol_implementation",
     ];
     let mut comparisons = fields.join(",") + "\r\n";
     for group in summary["comparisons"].as_array().into_iter().flatten() {

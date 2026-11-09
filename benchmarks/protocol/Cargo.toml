@@ -8,8 +8,8 @@ description = "Execution-free Spark Connect protocol and planning concurrency be
 build = "build.rs"
 
 [dependencies]
-spark-connect-proto = { package = "apache-spark-connect-proto", git = "https://github.com/apache/spark-connect-rust.git", rev = "9ed82b874357cdff887977864026d98f8b00f434" }
-spark-connect = { package = "apache-spark-connect", git = "https://github.com/apache/spark-connect-rust.git", rev = "9ed82b874357cdff887977864026d98f8b00f434" }
+spark-connect-proto = { package = "apache-spark-connect-proto", git = "https://github.com/dbtsai/spark-connect-rust.git", rev = "87b2b1e817e7384ed63e8b2385f4b5e4a51ad7ce" }
+spark-connect = { package = "apache-spark-connect", git = "https://github.com/dbtsai/spark-connect-rust.git", rev = "87b2b1e817e7384ed63e8b2385f4b5e4a51ad7ce" }
 arrow = { version = "58", default-features = false, features = ["ipc"] }
 futures = "0.3"
 prost = "0.14"

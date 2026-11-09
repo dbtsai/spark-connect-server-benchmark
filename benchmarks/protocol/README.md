@@ -1,6 +1,6 @@
 # Execution-free Spark Connect concurrency benchmarks
 
-This suite uses the official Apache Spark Connect Rust logical-plan builders and
+This suite uses Apache Spark Connect Rust logical-plan builders and the
 generated protobuf/gRPC client. It measures bounded concurrent RPCs with varied
 plans, Arrow types, payload sizes, session sharing, and channel sharing.
 
@@ -39,12 +39,29 @@ artifact upload forms, and per-chunk CRC rejection. Unsupported variants and
 deliberate error paths have explicit outcomes. Planning probes list excluded
 routes and persistence-changing analysis variants separately.
 
-The official Rust client is pinned to revision
-`9ed82b874357cdff887977864026d98f8b00f434`, whose protocol is Spark 4.3. The local
-Spark assembly is 4.2, so its JVM fixture returns `UNIMPLEMENTED` for GetStatus.
-That capability gap is retained and excluded from successful throughput. Coverage
-of every route does not imply conformance for every protobuf field, relation,
-expression, command, extension, UDF, catalog operation, or data type.
+The Rust client is pinned to fork revision
+`87b2b1e817e7384ed63e8b2385f4b5e4a51ad7ce`, using the Spark 4.3 protocol.
+It includes upstream array-literal fix SPARK-61119,
+[`70688ec07ff87ea5cd4d685247074feeaa2c2b7f`](https://github.com/apache/spark-connect-rust/commit/70688ec07ff87ea5cd4d685247074feeaa2c2b7f),
+and Arrow map-import normalization from the
+[complete fork diff](https://github.com/dbtsai/spark-connect-rust/compare/925dc876f63f1f779fe176f62575a0aa96cc6886...87b2b1e817e7384ed63e8b2385f4b5e4a51ad7ce).
+The map fix is proposed upstream in
+[PR #396](https://github.com/apache/spark-connect-rust/pull/396)
+([SPARK-61212](https://issues.apache.org/jira/browse/SPARK-61212)) and is not merged.
+The local Spark assembly is 4.2. Its synthetic JVM fixture adds the pinned
+GetStatus schema using Spark's shaded dynamic protobuf marshalling and gRPC
+descriptors, reusing the fixture's session and operation state. Fixture statistics
+identify the descriptor source. Both fixtures validate selector presence,
+filtering, unknown IDs, deduplication, operation states, user/session isolation,
+and session identity.
+See [GetStatus fixture contract and comparison limits](GETSTATUS_CONTRACT.md)
+for the pinned Spark source comparison, intentional lifecycle differences, and
+prost versus DynamicMessage timing annotations.
+
+The planning profile excludes GetStatus on the real Spark 4.2 server; it does not
+probe that route. Coverage of every route does not imply conformance for every
+protobuf field, relation, expression, command, extension, UDF, catalog operation,
+or data type.
 
 The corpus includes ranges, SQL, projection/filter chains, wide projections,
 balanced joins, unions, aggregates, windows/sorts, literals, and local Arrow
@@ -58,24 +75,29 @@ have the requested prefix removed, while an omitted or empty prefix preserves
 full names. Both fixtures and the JNI Spark engine apply that behavior, and
 regression checks cover filtered and unfiltered responses.
 
-Corpus preparation also completes compatibility details before timing. The pinned
-Rust client omits type annotations needed by Spark for complex literals, so the
-typed-literal projection fills each root `Literal.data_type` from the declared
-expected schema. Case metadata records this normalization and the final encoded
-size. Arrow map payloads explicitly use the child names `entries`, `key`, and
-`value` required by Spark's Arrow Java reader, replacing Arrow Rust's default
-plural key/value names. These are input-format corrections; the cases remain in
-the workload and undergo schema validation. Export a fresh corpus with the
-current binary after generator changes, since literal annotations and map IPC
-schemas change the frozen bytes and hashes.
+The typed-literal projection uses unmodified public client output. The upstream
+array fix preserves the declared type in `Array.element_type`; the root
+`Literal.data_type` can remain unset. Case metadata records
+`details.literal_data_type_fields: "official_client_unmodified"`. The benchmark
+no longer adds root type annotations.
 
-The unmodified public Rust API output remains the source of truth for client-gap
-claims. `api-audit` inspects that output before the corpus applies compatibility
-corrections, reports the observed typed-array annotation gap, and distinguishes
-generated-binding route coverage from high-level session API parity. Arrow map
-child naming is recorded as interoperability evidence. See
-[Rust API gaps](RUST_API_GAPS.md); this audit is not an exhaustive API inventory.
-Exported corpus manifests retain the observations under `rust_api_audit`.
+Timed Arrow fixtures are serialized directly by the harness and explicitly use
+the `entries`, `key`, and `value` map child names required by Arrow Java. The
+fork-pinned client normalizes default Arrow map names. Its client-side unit and
+live tests cover nested maps, shared input buffers, and nonempty inline/chunked
+imports; this benchmark audit checks only a zero-row top-level map.
+`api-audit` independently imports a zero-row default `MapBuilder` batch through
+`SparkSession::create_dataframe_from_arrow`, calls `to_relation()`, and inspects
+the resulting IPC schema. Default Arrow builder names alone are input evidence;
+the audit judges the client's emitted names.
+
+The audit also compares exact declared element types for populated, empty, and
+nested array literals. Resolved contracts and active client gaps are recorded
+separately, and generated-binding route coverage remains distinct from high-level
+session API parity. See [Rust API gaps](RUST_API_GAPS.md) for scope and evidence.
+Exported manifests retain these observations under `rust_api_audit`. Export a
+fresh corpus after client or generator changes: typed-literal bytes and audit
+evidence belong to the frozen dependency revision.
 
 | Corpus | Plans | Example dimensions |
 | --- | ---: | --- |
@@ -240,15 +262,15 @@ directory. The output directory must be new, and all servers bind to loopback.
 The binary also supports `export`, `serve-fixture`, `run`, and `codec` for manual
 experiments. `codec` records local protobuf encode/decode costs without a server;
 it is a separate measurement and is never subtracted from RPC timings. Audit the
-unmodified official API output without starting a server:
+unmodified public API output without starting a server:
 
 ```sh
-target/release/spark-connect-protocol-bench api-audit --output results/rust-api-audit.json
+target/release/spark-connect-protocol-bench api-audit --strict --output results/rust-api-audit.json
 ```
 
-Add `--strict` to make observed client gaps a nonzero exit status. The pinned
-revision currently has an observed typed-array annotation gap, so a strict audit
-is expected to fail until that contract changes.
+`--strict` makes an observed client gap a nonzero exit status. It is a regression
+gate for the fixed array-element and public Arrow map-import contracts. Omitting
+the flag still writes observed gaps without rejecting the command.
 
 Rust runner, reporter, comparator, and API-audit regression tests run without
 starting Spark or a JVM:

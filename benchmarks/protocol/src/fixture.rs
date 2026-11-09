@@ -1035,21 +1035,30 @@ impl SparkConnectService for Fixture {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         session.ensure_open()?;
-        let ids = input
-            .operation_status
-            .map(|status| status.operation_ids)
-            .unwrap_or_default();
         let mut operation_statuses = vec![];
-        for (id, operation) in &data.operations {
-            if ids.is_empty() || ids.contains(id) {
+        if let Some(selector) = input.operation_status {
+            let mut ids = selector.operation_ids;
+            if ids.is_empty() {
+                ids = data.operations.keys().cloned().collect();
+                ids.sort();
+            }
+            let mut seen = HashSet::new();
+            for id in ids {
+                if !seen.insert(id.clone()) {
+                    continue;
+                }
+                let state = data
+                    .operations
+                    .get(&id)
+                    .map(|operation| operation.state.load(Ordering::Acquire) as i32)
+                    .unwrap_or(1);
                 operation_statuses.push(proto::get_status_response::OperationStatus {
-                    operation_id: id.clone(),
-                    state: operation.state.load(Ordering::Acquire) as i32,
+                    operation_id: id,
+                    state,
                     ..Default::default()
                 });
             }
         }
-        operation_statuses.sort_by(|left, right| left.operation_id.cmp(&right.operation_id));
         Ok(Response::new(proto::GetStatusResponse {
             session_id: session.id.clone(),
             server_side_session_id: session.id.clone(),
@@ -1693,6 +1702,7 @@ mod tests {
             .get_status(Request::new(proto::GetStatusRequest {
                 session_id: id.clone(),
                 user_context: user(),
+                operation_status: Some(Default::default()),
                 ..Default::default()
             }))
             .await
@@ -1703,6 +1713,174 @@ mod tests {
         assert_eq!(status.operation_statuses[0].state, 4);
         fixture.shutdown();
         assert_eq!(fixture.stats()["sessions"], 0);
+    }
+
+    #[tokio::test]
+    async fn status_preserves_selector_presence_unknown_ids_and_distinct_request_order() {
+        let fixture = fixture();
+        let id = Uuid::new_v4().to_string();
+        let first = Uuid::new_v4().to_string();
+        let second = Uuid::new_v4().to_string();
+        let unknown = Uuid::new_v4().to_string();
+        for operation in [&first, &second] {
+            fixture
+                .execute_plan(Request::new(execute(&id, operation, vec![])))
+                .await
+                .unwrap();
+        }
+        let mut all = vec![(first.clone(), 4), (second.clone(), 4)];
+        all.sort();
+        for (ids, expected) in [
+            (None, vec![]),
+            (Some(vec![]), all),
+            (Some(vec![first.clone()]), vec![(first.clone(), 4)]),
+            (Some(vec![unknown.clone()]), vec![(unknown.clone(), 1)]),
+            (
+                Some(vec![
+                    second.clone(),
+                    unknown.clone(),
+                    first.clone(),
+                    second.clone(),
+                ]),
+                vec![
+                    (second.clone(), 4),
+                    (unknown.clone(), 1),
+                    (first.clone(), 4),
+                ],
+            ),
+        ] {
+            let response = fixture
+                .get_status(Request::new(proto::GetStatusRequest {
+                    session_id: id.clone(),
+                    user_context: user(),
+                    operation_status: ids.map(|operation_ids| {
+                        proto::get_status_request::OperationStatusRequest {
+                            operation_ids,
+                            ..Default::default()
+                        }
+                    }),
+                    ..Default::default()
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(response.session_id, id);
+            assert_eq!(response.server_side_session_id, id);
+            assert_eq!(
+                response
+                    .operation_statuses
+                    .into_iter()
+                    .map(|status| (status.operation_id, status.state))
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn status_forgets_released_operations_in_explicit_and_all_id_selectors() {
+        let fixture = fixture();
+        let id = Uuid::new_v4().to_string();
+        let released = Uuid::new_v4().to_string();
+        let retained = Uuid::new_v4().to_string();
+        for operation in [&released, &retained] {
+            fixture
+                .execute_plan(Request::new(execute(&id, operation, vec![])))
+                .await
+                .unwrap();
+        }
+        fixture
+            .release_execute(Request::new(proto::ReleaseExecuteRequest {
+                session_id: id.clone(),
+                user_context: user(),
+                operation_id: released.clone(),
+                release: Some(proto::release_execute_request::Release::ReleaseAll(
+                    Default::default(),
+                )),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        for (operation_ids, expected) in [
+            (vec![released.clone()], vec![(released, 1)]),
+            (vec![], vec![(retained, 4)]),
+        ] {
+            let response = fixture
+                .get_status(Request::new(proto::GetStatusRequest {
+                    session_id: id.clone(),
+                    user_context: user(),
+                    operation_status: Some(proto::get_status_request::OperationStatusRequest {
+                        operation_ids,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(
+                response
+                    .operation_statuses
+                    .into_iter()
+                    .map(|status| (status.operation_id, status.state))
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn status_validates_session_identity_and_does_not_cross_user_or_session_boundaries() {
+        let fixture = fixture();
+        let id = Uuid::new_v4().to_string();
+        let operation = Uuid::new_v4().to_string();
+        fixture
+            .execute_plan(Request::new(execute(&id, &operation, vec![])))
+            .await
+            .unwrap();
+        let request = proto::GetStatusRequest {
+            session_id: id.clone(),
+            user_context: user(),
+            operation_status: Some(proto::get_status_request::OperationStatusRequest {
+                operation_ids: vec![operation.clone()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut other_session = request.clone();
+        other_session.session_id = Uuid::new_v4().to_string();
+        let mut other_user = request.clone();
+        other_user.user_context.as_mut().unwrap().user_id = "other-fixture-user".into();
+        for request in [other_session, other_user] {
+            let response = fixture
+                .get_status(Request::new(request))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(response.operation_statuses.len(), 1);
+            assert_eq!(response.operation_statuses[0].operation_id, operation);
+            assert_eq!(response.operation_statuses[0].state, 1);
+        }
+        let mut mismatch = request.clone();
+        mismatch.client_observed_server_side_session_id = Some(Uuid::new_v4().to_string());
+        let mut missing_user = request.clone();
+        missing_user.user_context = None;
+        let mut invalid_session = request;
+        invalid_session.session_id = "invalid".into();
+        for (request, expected) in [
+            (mismatch, tonic::Code::FailedPrecondition),
+            (missing_user, tonic::Code::InvalidArgument),
+            (invalid_session, tonic::Code::InvalidArgument),
+        ] {
+            assert_eq!(
+                fixture
+                    .get_status(Request::new(request))
+                    .await
+                    .unwrap_err()
+                    .code(),
+                expected
+            );
+        }
     }
 
     #[test]

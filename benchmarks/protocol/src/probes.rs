@@ -155,6 +155,20 @@ impl Prober {
             "supported":null,"passed":true,"reason":reason}),
         );
     }
+    fn record_fixture_status(&mut self, variant: &str, outcome: Checked) {
+        // Both synthetic fixtures implement this route. Missing support is a
+        // fixture regression; real-server capability records remain separate.
+        self.record("GetStatus", variant, false, outcome);
+        self.records.last_mut().unwrap()["contract"] =
+            json!("synthetic fixture; see benchmarks/protocol/GETSTATUS_CONTRACT.md");
+    }
+    fn record_status_selector_setup(&mut self, outcome: Checked<()>) {
+        // The selector group records each GetStatus outcome itself. Its returned
+        // error can only come from the extra ExecutePlan stream used as setup.
+        if let Err(error) = outcome {
+            self.record("ExecutePlan", "status_probe_dependency", false, Err(error));
+        }
+    }
     async fn config(
         &mut self,
         session: &mut Session,
@@ -192,6 +206,33 @@ impl Prober {
             .into_inner();
         session.observe(&response.session_id, &response.server_side_session_id)?;
         Ok(json!({"identity_valid":true}))
+    }
+    async fn status(
+        &mut self,
+        session: &mut Session,
+        ids: Option<Vec<String>>,
+    ) -> Checked<proto::GetStatusResponse> {
+        let response = self
+            .client
+            .get_status(request(
+                proto::GetStatusRequest {
+                    session_id: session.id.clone(),
+                    user_context: Some(session.user.clone()),
+                    client_observed_server_side_session_id: session.observed.clone(),
+                    operation_status: ids.map(|operation_ids| {
+                        proto::get_status_request::OperationStatusRequest {
+                            operation_ids,
+                            ..Default::default()
+                        }
+                    }),
+                    ..Default::default()
+                },
+                self.timeout,
+            ))
+            .await?
+            .into_inner();
+        session.observe(&response.session_id, &response.server_side_session_id)?;
+        Ok(response)
     }
     async fn release_operation(
         &mut self,
@@ -315,6 +356,11 @@ pub async fn run(
                 "ReleaseSession",
                 "tombstone",
                 false,
+                expect_status(result, Code::FailedPrecondition),
+            );
+            let result = prober.status(&mut session, Some(vec![])).await;
+            prober.record_fixture_status(
+                "released_session_rejected",
                 expect_status(result, Code::FailedPrecondition),
             );
         } else {
@@ -836,6 +882,8 @@ async fn execute_probes(
             .map(|_| json!({"replayed_messages":resumed.len()}));
             prober.record("ReattachExecute", "last_response_cursor", false, result);
             status_probe(prober, session, &operation, 4, "completed_operation").await;
+            let setup = status_selector_probes(prober, session, &operation, payload).await;
+            prober.record_status_selector_setup(setup);
             let result = prober
                 .release_operation(
                     session,
@@ -897,34 +945,150 @@ async fn status_probe(
     variant: &str,
 ) {
     let result = async {
-        let response = prober
+        let response = prober.status(session, Some(vec![operation.into()])).await?;
+        validate_statuses(&response, &[(operation.into(), state)])?;
+        Ok(json!({"operation_state":state}))
+    }
+    .await;
+    prober.record_fixture_status(variant, result);
+}
+
+fn validate_statuses(
+    response: &proto::GetStatusResponse,
+    expected: &[(String, i32)],
+) -> Checked<()> {
+    let actual = response
+        .operation_statuses
+        .iter()
+        .map(|status| (status.operation_id.clone(), status.state))
+        .collect::<Vec<_>>();
+    require(
+        actual.as_slice() == expected,
+        "synthetic GetStatus selection, order, or state contract changed",
+    )
+}
+
+async fn status_selector_probes(
+    prober: &mut Prober,
+    session: &mut Session,
+    operation: &str,
+    payload: &Payload,
+) -> Checked<()> {
+    // Keep two operations in this session so filtering cannot pass by returning every record.
+    let other = Uuid::new_v4().to_string();
+    let stream = prober
+        .client
+        .execute_plan(request(
+            execute_request(session, &other, vec!["bench.payload=range".into()]),
+            prober.timeout,
+        ))
+        .await?
+        .into_inner();
+    let messages = collect(stream, prober.timeout).await?;
+    validate_stream(session, &other, &messages, payload, 1)?;
+    let unknown = Uuid::new_v4().to_string();
+    // Sorted all-ID responses are a deterministic fixture contract. Spark's
+    // active/inactive operation collections do not promise this ordering.
+    let mut all = vec![(operation.into(), 4), (other.clone(), 4)];
+    all.sort();
+    let cases = [
+        ("absent_operation_status", None, vec![]),
+        ("empty_operation_status_lists_all", Some(vec![]), all),
+        (
+            "operation_id_filter",
+            Some(vec![operation.into()]),
+            vec![(operation.into(), 4)],
+        ),
+        (
+            "unknown_operation",
+            Some(vec![unknown.clone()]),
+            vec![(unknown.clone(), 1)],
+        ),
+        (
+            "deduplicated_requested_order",
+            Some(vec![
+                other.clone(),
+                unknown.clone(),
+                operation.into(),
+                other.clone(),
+            ]),
+            vec![(other.clone(), 4), (unknown, 1), (operation.into(), 4)],
+        ),
+    ];
+    for (variant, ids, expected) in cases {
+        let result = async {
+            let response = prober.status(session, ids).await?;
+            validate_statuses(&response, &expected)?;
+            Ok(json!({"operation_statuses":expected}))
+        }
+        .await;
+        prober.record_fixture_status(variant, result);
+    }
+    let mut other_user = session.clone();
+    other_user.user.user_id = format!("rust-status-probe-{}", Uuid::new_v4().simple());
+    other_user.observed = None;
+    prober.sessions.push(other_user.clone());
+    for (variant, mut isolated) in [
+        ("session_isolation", prober.session()),
+        ("user_isolation", other_user),
+    ] {
+        let result = async {
+            let response = prober.status(&mut isolated, Some(vec![])).await?;
+            validate_statuses(&response, &[])?;
+            let response = prober
+                .status(&mut isolated, Some(vec![operation.into()]))
+                .await?;
+            validate_statuses(&response, &[(operation.into(), 1)])?;
+            Ok(json!({"operation_hidden":true,"explicit_lookup_state":1}))
+        }
+        .await;
+        prober.record_fixture_status(variant, result);
+    }
+    let mut mismatched = session.clone();
+    mismatched.observed = Some(Uuid::new_v4().to_string());
+    let result = prober.status(&mut mismatched, Some(vec![])).await;
+    prober.record_fixture_status(
+        "observed_session_mismatch",
+        expect_status(result, Code::FailedPrecondition),
+    );
+    for (variant, id, user) in [
+        ("missing_user_context", session.id.clone(), None),
+        (
+            "invalid_session_id",
+            "invalid".into(),
+            Some(session.user.clone()),
+        ),
+    ] {
+        let result = prober
             .client
             .get_status(request(
                 proto::GetStatusRequest {
-                    session_id: session.id.clone(),
-                    user_context: Some(session.user.clone()),
-                    client_observed_server_side_session_id: session.observed.clone(),
-                    operation_status: Some(proto::get_status_request::OperationStatusRequest {
-                        operation_ids: vec![operation.into()],
-                        ..Default::default()
-                    }),
+                    session_id: id,
+                    user_context: user,
                     ..Default::default()
                 },
                 prober.timeout,
             ))
-            .await?
-            .into_inner();
-        session.observe(&response.session_id, &response.server_side_session_id)?;
-        require(
-            response.operation_statuses.len() == 1
-                && response.operation_statuses[0].operation_id == operation
-                && response.operation_statuses[0].state == state,
-            "GetStatus operation/state changed",
-        )?;
-        Ok(json!({"operation_state":state}))
+            .await;
+        prober.record_fixture_status(variant, expect_status(result, Code::InvalidArgument));
+    }
+    let released = prober
+        .release_operation(
+            session,
+            &other,
+            proto::release_execute_request::Release::ReleaseAll(Default::default()),
+        )
+        .await;
+    prober.record("ReleaseExecute", "status_probe_dependency", false, released);
+    status_probe(prober, session, &other, 1, "released_operation_unknown").await;
+    let result = async {
+        let response = prober.status(session, Some(vec![])).await?;
+        validate_statuses(&response, &[(operation.into(), 4)])?;
+        Ok(json!({"released_operation_omitted":other,"retained_operation":operation}))
     }
     .await;
-    prober.record("GetStatus", variant, true, result);
+    prober.record_fixture_status("all_operations_omit_released", result);
+    Ok(())
 }
 async fn interrupt_probe(prober: &mut Prober, session: &mut Session, selector: &str) -> Checked {
     let operation = Uuid::new_v4().to_string();
@@ -1228,6 +1392,167 @@ async fn error_probes(prober: &mut Prober, session: &mut Session) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn status_selector_setup_failures_are_execute_plan_dependencies() {
+        let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let mut prober = Prober {
+            client: SparkConnectServiceClient::new(channel),
+            timeout: Duration::from_secs(1),
+            records: vec![],
+            sessions: vec![],
+        };
+        prober.record_status_selector_setup(Ok(()));
+        assert!(prober.records.is_empty());
+        prober.record_status_selector_setup(Err(Status::internal("setup stream failed").into()));
+        prober.record_status_selector_setup(Err(Failure::Invalid(
+            "setup Arrow batch mismatch".into(),
+        )));
+        assert_eq!(prober.records.len(), 2);
+        for record in &prober.records {
+            assert_eq!(record["route"], "ExecutePlan");
+            assert_eq!(record["variant"], "status_probe_dependency");
+            assert_eq!(record["passed"], false);
+            assert!(record.get("contract").is_none());
+        }
+        assert_eq!(prober.records[0]["status"], "Internal");
+        assert_eq!(prober.records[1]["status"], "VALIDATION_FAILED");
+    }
+
+    #[test]
+    fn get_status_shared_java_vectors_match_prost_encoding_and_presence() {
+        fn wire(hex: &str) -> Vec<u8> {
+            hex.trim()
+                .as_bytes()
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+                .collect()
+        }
+        let mut request = proto::GetStatusRequest {
+            session_id: "s".into(),
+            user_context: Some(proto::UserContext {
+                user_id: "u".into(),
+                ..Default::default()
+            }),
+            client_type: Some(String::new()),
+            client_observed_server_side_session_id: Some(String::new()),
+            operation_status: Some(proto::get_status_request::OperationStatusRequest {
+                operation_ids: vec!["b".into(), "a".into(), "b".into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        request.extensions.push(Default::default());
+        request.extensions[0].type_url = "t".into();
+        request.extensions[0].value = vec![b'x'];
+        let bytes = wire(include_str!("../testdata/get-status/request.hex"));
+        assert_eq!(request.encode_to_vec(), bytes);
+        assert_eq!(
+            proto::GetStatusRequest::decode(bytes.as_slice()).unwrap(),
+            request
+        );
+
+        request.extensions.clear();
+        request.operation_status = Some(Default::default());
+        let empty = wire(include_str!("../testdata/get-status/empty-request.hex"));
+        assert_eq!(request.encode_to_vec(), empty);
+        assert!(proto::GetStatusRequest::decode(empty.as_slice())
+            .unwrap()
+            .operation_status
+            .is_some());
+        request.client_type = None;
+        request.client_observed_server_side_session_id = None;
+        request.operation_status = None;
+        let absent = wire(include_str!("../testdata/get-status/absent-request.hex"));
+        assert_eq!(request.encode_to_vec(), absent);
+        assert!(proto::GetStatusRequest::decode(absent.as_slice())
+            .unwrap()
+            .operation_status
+            .is_none());
+
+        let response = proto::GetStatusResponse {
+            session_id: "s".into(),
+            server_side_session_id: "s".into(),
+            operation_statuses: [("b", 2), ("missing", 1)]
+                .into_iter()
+                .map(|(id, state)| proto::get_status_response::OperationStatus {
+                    operation_id: id.into(),
+                    state,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let bytes = wire(include_str!("../testdata/get-status/response.hex"));
+        assert_eq!(response.encode_to_vec(), bytes);
+        assert_eq!(
+            proto::GetStatusResponse::decode(bytes.as_slice()).unwrap(),
+            response
+        );
+    }
+
+    #[tokio::test]
+    async fn fixture_status_requires_support_while_capability_checks_allow_unimplemented() {
+        let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let mut prober = Prober {
+            client: SparkConnectServiceClient::new(channel),
+            timeout: Duration::from_secs(1),
+            records: vec![],
+            sessions: vec![],
+        };
+        prober.record_fixture_status(
+            "missing_route",
+            Err(Status::unimplemented("missing").into()),
+        );
+        assert_eq!(prober.records[0]["passed"], false);
+        assert_eq!(prober.records[0]["supported"], false);
+        prober.record(
+            "GetStatus",
+            "real_server_capability",
+            true,
+            Err(Status::unimplemented("older server").into()),
+        );
+        assert_eq!(prober.records[1]["passed"], true);
+        assert_eq!(prober.records[1]["supported"], false);
+        prober.record_fixture_status(
+            "expected_session_rejection",
+            expect_status(
+                Err::<(), _>(Status::failed_precondition("released")),
+                Code::FailedPrecondition,
+            ),
+        );
+        assert_eq!(prober.records[2]["passed"], true);
+        assert_eq!(prober.records[2]["supported"], true);
+    }
+
+    #[test]
+    fn status_validation_rejects_missing_duplicate_extra_reordered_and_wrong_state_records() {
+        let expected = vec![("known".into(), 4), ("unknown".into(), 1)];
+        let response = |statuses: &[(&str, i32)]| proto::GetStatusResponse {
+            operation_statuses: statuses
+                .iter()
+                .map(|(id, state)| proto::get_status_response::OperationStatus {
+                    operation_id: (*id).into(),
+                    state: *state,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        assert!(validate_statuses(&response(&[("known", 4), ("unknown", 1)]), &expected).is_ok());
+        for invalid in [
+            vec![("known", 4)],
+            vec![("known", 4), ("unknown", 1), ("unknown", 1)],
+            vec![("known", 4), ("unknown", 1), ("extra", 4)],
+            vec![("unknown", 1), ("known", 4)],
+            vec![("known", 2), ("unknown", 1)],
+        ] {
+            assert!(validate_statuses(&response(&invalid), &expected).is_err());
+        }
+    }
+
     #[test]
     fn config_validation_matches_spark_prefix_stripping_and_registered_modifiability() {
         let prefix = "bench.protocol.unique.";

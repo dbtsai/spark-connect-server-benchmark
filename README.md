@@ -1,7 +1,7 @@
 # Spark Connect server benchmarks
 
-Concurrency and protocol benchmarks driven directly by the official Apache Spark
-Connect Rust client. Compare upstream JVM Spark Connect with a Rust frontend that
+Concurrency and protocol benchmarks driven directly by Apache Spark Connect Rust
+client APIs. Compare upstream JVM Spark Connect with a Rust frontend that
 calls Spark Catalyst and execution APIs through JNI. The Rust frontend also has a
 DataFusion backend for standalone experiments.
 
@@ -43,13 +43,28 @@ Concurrency, session sharing, and HTTP/2 channel sharing vary independently.
 - The separate executed-query benchmarks and Python acceptance need Python 3.9
   or newer, a compatible official PySpark Connect client, gRPC, and PyArrow.
 
-The official Rust client/protocol is pinned to
-[`9ed82b874357cdff887977864026d98f8b00f434`](https://github.com/apache/spark-connect-rust/commit/9ed82b874357cdff887977864026d98f8b00f434)
-(Spark 4.3 protocol). The JVM adapters were developed against Spark
+The Rust client/protocol is pinned to fork revision
+`87b2b1e817e7384ed63e8b2385f4b5e4a51ad7ce` (Spark 4.3 protocol).
+It includes upstream array-literal fix SPARK-61119,
+[`70688ec07ff87ea5cd4d685247074feeaa2c2b7f`](https://github.com/apache/spark-connect-rust/commit/70688ec07ff87ea5cd4d685247074feeaa2c2b7f),
+and Arrow map-import normalization from the
+[complete fork diff](https://github.com/dbtsai/spark-connect-rust/compare/925dc876f63f1f779fe176f62575a0aa96cc6886...87b2b1e817e7384ed63e8b2385f4b5e4a51ad7ce).
+The map fix is proposed upstream in
+[PR #396](https://github.com/apache/spark-connect-rust/pull/396)
+([SPARK-61212](https://issues.apache.org/jira/browse/SPARK-61212)) and is not merged.
+The typed-literal workload uses unmodified client output, and the public Arrow
+import audit checks canonical map names in the client's serialized IPC.
+The JVM adapters were developed against Spark
 4.2.0-SNAPSHOT assembly revision `250ccca3f2b5f043e20b415adf17bda5d202c60f`,
 Scala 2.13.17, and JDK 21.0.10. They use Spark internal APIs; another assembly may
-require source changes. Spark 4.2 lacks GetStatus, which is explicitly recorded
-as unsupported rather than counted as successful throughput.
+require source changes. The planning profile excludes GetStatus on the real
+Spark 4.2 server, whose assembly predates the route; it does not probe it. The
+synthetic JVM fixture adds the pinned 4.3 GetStatus schema through Spark's shaded
+dynamic protobuf/gRPC APIs, with its descriptor source recorded in fixture
+statistics. This compatibility route exercises the
+fixture's session and retained-operation state. See the
+[GetStatus fixture contract](benchmarks/protocol/GETSTATUS_CONTRACT.md) for
+comparison limits and wire codec annotations.
 
 ## Build and run
 
@@ -86,17 +101,18 @@ The native filename defaults to `libspark_connect_jni.dylib` on macOS and
 with `--spark-home`/`--java-home`. Use a new output directory for every run.
 
 The benchmark crate exposes its corpus, runner, reporter, comparison, and audit
-modules as a Rust library. Plans originate from the pinned official Rust public
+modules as a Rust library. Plans originate from the pinned Rust client's public
 logical-plan/expression APIs; all-route protocol probes use its generated
-protobuf/gRPC bindings. The separate audit records observed gaps before corpus
-compatibility corrections:
+protobuf/gRPC bindings. The separate audit checks exact declared array element
+types and imports a default Arrow map through the public session API:
 
 ```sh
-target/release/spark-connect-protocol-bench api-audit --output results/rust-api-audit.json
+target/release/spark-connect-protocol-bench api-audit --strict --output results/rust-api-audit.json
 ```
 
 See [Rust API gaps](benchmarks/protocol/RUST_API_GAPS.md) for scope and evidence.
-`api-audit --strict` exits nonzero when an observed client gap remains. A suite
+`api-audit --strict` is a regression gate for these contracts and exits nonzero
+when it observes a client gap. A suite
 freezes its executable at `artifacts/harness`; using that copy for reporting
 preserves the producer identity recorded in `analysis_reporter_sha256`.
 

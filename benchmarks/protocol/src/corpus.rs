@@ -1,6 +1,6 @@
 //! Deterministic, read-only plans and Arrow payloads built before timed RPCs.
 //!
-//! Relation plans use the official Rust client's public logical-plan builders.
+//! Relation plans use the pinned fork Rust client's public logical-plan builders.
 //! This corpus covers representative shapes and types; it does not claim every
 //! relation or expression variant in Spark Connect.
 
@@ -500,38 +500,8 @@ pub(crate) fn raw_typed_literals() -> PlanCase {
 }
 
 fn typed_literals() -> PlanCase {
-    let mut case = raw_typed_literals();
-    let Some(proto::data_type::Kind::Struct(schema)) = case.expected_schema.kind.as_ref() else {
-        unreachable!("typed literal schema is a struct");
-    };
-    let literal_types = schema
-        .fields
-        .iter()
-        .map(|field| field.data_type.clone().expect("declared type"));
-    // The pinned official client omits both Array.element_type and the current
-    // Literal.data_type field. Spark requires the root type for complex values.
-    // Keep the official plan builders and complete these protocol annotations
-    // from the same declared types used for expected-schema validation.
-    let Some(proto::relation::RelType::Project(project)) = case.relation.rel_type.as_mut() else {
-        unreachable!("typed literals are a projection");
-    };
-    for (expression, data_type) in project.expressions.iter_mut().zip(literal_types) {
-        let Some(proto::expression::ExprType::Alias(alias)) = expression.expr_type.as_mut() else {
-            unreachable!("typed literal columns are named aliases");
-        };
-        let Some(proto::expression::ExprType::Literal(literal)) = alias
-            .expr
-            .as_deref_mut()
-            .and_then(|expression| expression.expr_type.as_mut())
-        else {
-            unreachable!("typed literal aliases contain literals");
-        };
-        literal.data_type = Some(data_type);
-    }
-    case.metadata["encoded_relation_bytes"] = json!(case.relation.encoded_len());
-    case.metadata["details"]["literal_data_type_fields"] = json!("explicit_from_declared_schema");
-    case.metadata["rust_api_gap_ids"] = json!(["typed_array_literal_annotations"]);
-    case
+    // The timed case intentionally matches the raw output inspected by the client audit.
+    raw_typed_literals()
 }
 
 fn case(
@@ -1058,8 +1028,16 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
-    fn typed_literal_roots_include_the_declared_type_for_spark_complex_values() {
+    fn typed_literals_preserve_unmodified_pinned_client_output_and_array_element_type() {
         let case = typed_literals();
+        let raw = raw_typed_literals();
+        assert_eq!(case.relation.encode_to_vec(), raw.relation.encode_to_vec());
+        assert_eq!(case.metadata, raw.metadata);
+        assert_eq!(
+            case.metadata["details"]["literal_data_type_fields"],
+            "official_client_unmodified"
+        );
+        assert!(case.metadata.get("rust_api_gap_ids").is_none());
         let Some(proto::relation::RelType::Project(project)) = case.relation.rel_type else {
             panic!("typed literal projection");
         };
@@ -1077,20 +1055,29 @@ mod tests {
             else {
                 panic!("typed literal value");
             };
-            assert_eq!(literal.data_type, field.data_type);
+            if let Some(root_type) = literal.data_type.as_ref() {
+                assert_eq!(Some(root_type), field.data_type.as_ref());
+            }
             if let Some(proto::expression::literal::LiteralType::Array(array)) =
                 literal.literal_type
             {
                 arrays += 1;
                 let Some(proto::data_type::Kind::Array(data_type)) =
-                    literal.data_type.and_then(|data_type| data_type.kind)
+                    field.data_type.and_then(|data_type| data_type.kind)
                 else {
-                    panic!("array literal needs a root array type");
+                    panic!("declared array schema");
                 };
-                assert!(matches!(
-                    data_type.element_type.and_then(|data_type| data_type.kind),
-                    Some(proto::data_type::Kind::Integer(_))
-                ));
+                #[allow(deprecated)]
+                {
+                    if let Some(element_type) = array.element_type.as_ref() {
+                        assert_eq!(Some(element_type), data_type.element_type.as_deref());
+                    }
+                    assert!(literal.data_type.is_some() || array.element_type.is_some());
+                }
+                assert_eq!(
+                    data_type.element_type.as_deref(),
+                    Some(&SparkType::Integer.to_proto())
+                );
                 assert!(data_type.contains_null);
                 assert_eq!(array.elements.len(), 3);
                 assert!(matches!(
